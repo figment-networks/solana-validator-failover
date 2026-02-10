@@ -352,6 +352,45 @@ func BenchmarkNewIdentityFromFile(b *testing.B) {
 	}
 }
 
+func TestNewIdentityFromPubkey_Success(t *testing.T) {
+	pubkey := "11111111111111111111111111111111"
+	identity, err := NewIdentityFromPubkey(pubkey)
+
+	require.NoError(t, err)
+	require.NotNil(t, identity)
+	assert.Nil(t, identity.Key)
+	assert.Empty(t, identity.KeyFile)
+	assert.Equal(t, pubkey, identity.PubKey())
+	assert.Equal(t, pubkey, identity.PubKeyStr)
+}
+
+func TestNewIdentityFromPubkey_InvalidBase58(t *testing.T) {
+	identity, err := NewIdentityFromPubkey("not-valid-base58!!!")
+
+	assert.Error(t, err)
+	assert.Nil(t, identity)
+	assert.Contains(t, err.Error(), "failed to parse pubkey")
+}
+
+func TestIdentity_PubKey_PubkeyOnlyMode(t *testing.T) {
+	identity := &Identity{
+		PubKeyStr: "SysvarC1ock11111111111111111111111111111111",
+	}
+
+	assert.Equal(t, "SysvarC1ock11111111111111111111111111111111", identity.PubKey())
+}
+
+func TestIdentity_PubKey_KeypairTakesPrecedence(t *testing.T) {
+	privateKey := solana.NewWallet().PrivateKey
+	identity := &Identity{
+		Key:       privateKey,
+		PubKeyStr: "11111111111111111111111111111111", // should be ignored
+	}
+
+	assert.Equal(t, privateKey.PublicKey().String(), identity.PubKey())
+	assert.NotEqual(t, "11111111111111111111111111111111", identity.PubKey())
+}
+
 func BenchmarkIdentity_Pubkey(b *testing.B) {
 	// Create a test identity
 	privateKey := solana.NewWallet().PrivateKey

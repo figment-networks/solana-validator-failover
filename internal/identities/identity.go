@@ -8,13 +8,16 @@ import (
 	"github.com/sol-strategies/solana-validator-failover/internal/utils"
 )
 
-// Identity holds the information for an identity
+// Identity holds the information for an identity.
+// In full keypair mode, Key is populated from a file. In pubkey-only mode,
+// only PubKeyStr is set and Key is nil.
 type Identity struct {
-	KeyFile string // path to the identity key file
-	Key     solana.PrivateKey
+	KeyFile   string // path to the identity key file (empty in pubkey-only mode)
+	Key       solana.PrivateKey
+	PubKeyStr string // base58 public key string (always populated)
 }
 
-// NewIdentityFromFile Identity from a key file
+// NewIdentityFromFile creates an Identity from a keypair file
 func NewIdentityFromFile(keyFile string) (identity *Identity, err error) {
 	logger := log.With().Str("component", "identities").Logger()
 	// resolve path
@@ -37,10 +40,32 @@ func NewIdentityFromFile(keyFile string) (identity *Identity, err error) {
 		return
 	}
 
+	identity.PubKeyStr = identity.Key.PublicKey().String()
+
 	logger.Debug().
-		Str("pubkey", identity.Key.PublicKey().String()).
+		Str("pubkey", identity.PubKeyStr).
 		Str("file", keyFileAbsolutePath).
 		Msg("parsed solana keygen file")
+
+	return identity, nil
+}
+
+// NewIdentityFromPubkey creates an Identity from a base58 public key string.
+// The identity operates in pubkey-only mode: no keypair file, no private key.
+func NewIdentityFromPubkey(pubkey string) (identity *Identity, err error) {
+	logger := log.With().Str("component", "identities").Logger()
+
+	if _, err := solana.PublicKeyFromBase58(pubkey); err != nil {
+		return nil, fmt.Errorf("failed to parse pubkey as base58 public key: %w", err)
+	}
+
+	identity = &Identity{
+		PubKeyStr: pubkey,
+	}
+
+	logger.Debug().
+		Str("pubkey", pubkey).
+		Msg("loaded identity from pubkey string (pubkey-only mode)")
 
 	return identity, nil
 }
@@ -51,8 +76,11 @@ func (i *Identity) Pubkey() string {
 	return i.PubKey()
 }
 
-// PubKey is the PascalCase counterpart of Pubkey - it's what we should have always used but let's be honest about why not:
-// @coderigo messed up in the early README and claimed PubKey was supported when it was really Pubkey
+// PubKey returns the public key string. If a keypair is loaded, derives from
+// the private key; otherwise returns the configured pubkey string.
 func (i *Identity) PubKey() string {
-	return i.Key.PublicKey().String()
+	if i.Key != nil {
+		return i.Key.PublicKey().String()
+	}
+	return i.PubKeyStr
 }

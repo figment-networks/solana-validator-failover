@@ -546,7 +546,7 @@ func (s *Stream) SetPassiveNodeSyncTowerFileEndTime() {
 
 // PullActiveIdentityVoteCreditsSample pulls a sample of the vote credits for the active identity
 func (s *Stream) PullActiveIdentityVoteCreditsSample(solanaRPCClient solana.ClientInterface) (err error) {
-	identityPubkey := s.message.ActiveNodeInfo.Identities.Active.Key.PublicKey().String()
+	identityPubkey := s.message.ActiveNodeInfo.Identities.Active.PubKey()
 
 	// fetch current state of vote account from its pubkey
 	voteAccount, creditRank, err := solanaRPCClient.GetCreditRankedVoteAccountFromPubkey(identityPubkey)

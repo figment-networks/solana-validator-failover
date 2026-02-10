@@ -57,6 +57,8 @@ func TestNewFromConfig_Success(t *testing.T) {
 	assert.Equal(t, passiveKey.String(), identities.Passive.Key.String())
 	assert.Equal(t, activeKey.PublicKey().String(), identities.Active.PubKey())
 	assert.Equal(t, passiveKey.PublicKey().String(), identities.Passive.PubKey())
+	assert.Equal(t, activeKey.PublicKey().String(), identities.Active.PubKeyStr)
+	assert.Equal(t, passiveKey.PublicKey().String(), identities.Passive.PubKeyStr)
 }
 
 func TestNewFromConfig_ActiveFileNotFound(t *testing.T) {
@@ -269,4 +271,142 @@ func TestNewFromConfig_WithTildePaths(t *testing.T) {
 	assert.Equal(t, passiveKeyFile, identities.Passive.KeyFile)
 	assert.Equal(t, activeKey.String(), identities.Active.Key.String())
 	assert.Equal(t, passiveKey.String(), identities.Passive.Key.String())
+}
+
+func TestNewFromConfig_PubkeyOnly(t *testing.T) {
+	activePubkey := "11111111111111111111111111111111"
+	passivePubkey := "SysvarC1ock11111111111111111111111111111111"
+
+	cfg := &Config{
+		ActivePubkey:  activePubkey,
+		PassivePubkey: passivePubkey,
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	require.NoError(t, err)
+	require.NotNil(t, identities)
+	assert.Nil(t, identities.Active.Key)
+	assert.Nil(t, identities.Passive.Key)
+	assert.Empty(t, identities.Active.KeyFile)
+	assert.Empty(t, identities.Passive.KeyFile)
+	assert.Equal(t, activePubkey, identities.Active.PubKey())
+	assert.Equal(t, passivePubkey, identities.Passive.PubKey())
+}
+
+func TestNewFromConfig_MixedMode(t *testing.T) {
+	// Active from pubkey, passive from keypair file
+	tempDir := t.TempDir()
+	passiveKeyFile := filepath.Join(tempDir, "passive-key.json")
+
+	passiveKey := solana.NewWallet().PrivateKey
+	passiveKeyBytes := []byte(passiveKey)
+	passiveKeyData, err := json.Marshal(passiveKeyBytes)
+	require.NoError(t, err)
+	err = os.WriteFile(passiveKeyFile, passiveKeyData, 0600)
+	require.NoError(t, err)
+
+	cfg := &Config{
+		ActivePubkey: "11111111111111111111111111111111",
+		Passive:      passiveKeyFile,
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	require.NoError(t, err)
+	require.NotNil(t, identities)
+	assert.Nil(t, identities.Active.Key)
+	assert.NotNil(t, identities.Passive.Key)
+	assert.Equal(t, "11111111111111111111111111111111", identities.Active.PubKey())
+	assert.Equal(t, passiveKey.PublicKey().String(), identities.Passive.PubKey())
+}
+
+func TestNewFromConfig_PubkeyOnlySameIdentities(t *testing.T) {
+	cfg := &Config{
+		ActivePubkey:  "11111111111111111111111111111111",
+		PassivePubkey: "11111111111111111111111111111111",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Contains(t, err.Error(), "active and passive identities must be different")
+}
+
+func TestNewFromConfig_InvalidActivePubkey(t *testing.T) {
+	cfg := &Config{
+		ActivePubkey:  "not-valid-base58",
+		PassivePubkey: "SysvarC1ock11111111111111111111111111111111",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Contains(t, err.Error(), "failed to load active identity")
+}
+
+func TestNewFromConfig_InvalidPassivePubkey(t *testing.T) {
+	cfg := &Config{
+		ActivePubkey:  "11111111111111111111111111111111",
+		PassivePubkey: "not-valid-base58",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Contains(t, err.Error(), "failed to load passive identity")
+}
+
+func TestNewFromConfig_NeitherActiveNorPubkey(t *testing.T) {
+	cfg := &Config{
+		PassivePubkey: "SysvarC1ock11111111111111111111111111111111",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Contains(t, err.Error(), "either identities.active")
+}
+
+func TestNewFromConfig_NeitherPassiveNorPubkey(t *testing.T) {
+	cfg := &Config{
+		ActivePubkey: "11111111111111111111111111111111",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Contains(t, err.Error(), "either identities.passive")
+}
+
+func TestNewFromConfig_KeypairFileOverridesPubkey(t *testing.T) {
+	// When both keypair file and pubkey are set, file takes precedence
+	tempDir := t.TempDir()
+	activeKeyFile := filepath.Join(tempDir, "active-key.json")
+
+	activeKey := solana.NewWallet().PrivateKey
+	activeKeyBytes := []byte(activeKey)
+	activeKeyData, err := json.Marshal(activeKeyBytes)
+	require.NoError(t, err)
+	err = os.WriteFile(activeKeyFile, activeKeyData, 0600)
+	require.NoError(t, err)
+
+	cfg := &Config{
+		Active:        activeKeyFile,
+		ActivePubkey:  "11111111111111111111111111111111", // should be ignored
+		PassivePubkey: "SysvarC1ock11111111111111111111111111111111",
+	}
+
+	identities, err := NewFromConfig(cfg)
+
+	require.NoError(t, err)
+	require.NotNil(t, identities)
+	// Should use the key from file, not the pubkey string
+	assert.Equal(t, activeKey.PublicKey().String(), identities.Active.PubKey())
+	assert.NotEqual(t, "11111111111111111111111111111111", identities.Active.PubKey())
 }

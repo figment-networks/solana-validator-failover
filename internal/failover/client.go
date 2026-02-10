@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh/spinner"
+	solanago "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -296,7 +297,10 @@ func (c *Client) waitMinTimeToLeaderSlot() (err error) {
 	var calculatedTimeToNextLeaderSlot time.Duration
 	sp.ActionWithErr(func(ctx context.Context) error {
 		sleepDuration := 2 * time.Second
-		pubkey := c.activeNodeInfo.Identities.Active.Key.PublicKey()
+		pubkey, err := solanago.PublicKeyFromBase58(c.activeNodeInfo.Identities.Active.PubKey())
+		if err != nil {
+			return fmt.Errorf("failed to parse active identity pubkey: %w", err)
+		}
 		remainingRetries := maxRetries
 		stringMinTimeToLeaderSlot := c.minTimeToLeaderSlot.Round(time.Second).String()
 
