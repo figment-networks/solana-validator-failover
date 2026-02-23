@@ -9,9 +9,29 @@ REPO_TAG=${REPO_TAG:-}
 APP_VERSION=${APP_VERSION:-}
 
 gh_create_release() {
+    log_info "fetching auto-generated changelog from GitHub API"
+    PREV_TAG=$(gh release list --repo "${GITHUB_REPO}" --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
+
+    if [ -n "${PREV_TAG}" ]; then
+        log_info "generating notes from ${PREV_TAG} to ${REPO_TAG}"
+        AUTO_NOTES=$(gh api repos/${GITHUB_REPO}/releases/generate-notes \
+            --method POST \
+            --field tag_name=${REPO_TAG} \
+            --field previous_tag_name=${PREV_TAG} \
+            -q '.body')
+    else
+        log_info "no previous release found, generating notes from the beginning"
+        AUTO_NOTES=$(gh api repos/${GITHUB_REPO}/releases/generate-notes \
+            --method POST \
+            --field tag_name=${REPO_TAG} \
+            -q '.body')
+    fi
+
     log_info "creating release notes"
     cat > release-notes.md <<EOF
-## Release ${APP_VERSION}
+${AUTO_NOTES}
+
+---
 
 ### Installation
 Download the appropriate binary for your platform and extract it:
@@ -23,9 +43,7 @@ chmod +x solana-validator-failover-${APP_VERSION}-<platform>
 \`\`\`
 
 ### Verification
-Each binary includes a SHA256 checksum file for integrity verification.
-
-To verify a binary:
+Each binary includes a SHA256 checksum file for integrity verification:
 \`\`\`bash
 sha256sum -c solana-validator-failover-${APP_VERSION}-<platform>.sha256
 \`\`\`
