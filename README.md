@@ -2,48 +2,85 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simple p2p Solana validator failovers. This tool helps automate _planned_ failvoers. To automate _unexpected_ failovers, see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
+Simple p2p Solana validator failovers. This tool helps automate _planned_ failovers. To automate _unexpected_ failovers, see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
 
-![solanna-validator-failover-passive-to-active-png](vhs/failover-passive-to-active.png)
+![solana-validator-failover](vhs/failover-passive-to-active.png)
 
-A simple QUIC-based program to failover between Solana validators safely and quickly. [This post](https://blog.solstrategies.io/quic-solana-validator-failovers-738d712ac737) explains some background in more detail. In summary this program orchestrates the three-step process of failing over from an active (voting) to a passive (non-voting) validator:
+A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://blog.solstrategies.io/quic-solana-validator-failovers-738d712ac737) covers the background in more detail. In summary, it coordinates three steps across both nodes:
 
-1. active validator sets identity to passive
-2. tower file synced from active to passive validator
-3. passive validator sets identity to active
-
-Start a failover server on the passive node:
-
-![solanna-validator-failover-passive-to-active](vhs/failover-passive-to-active.gif)
-
-Start a failover client on the active node to hand over to the passive node:
-
-![solanna-validator-failover-active-to-passive](vhs/failover-active-to-passive.gif)
+1. Active validator sets identity to passive
+2. Tower file synced from active to passive validator
+3. Passive validator sets identity to active
 
 Convenience safety checks, bells, and whistles:
 
 - Check and wait for validator health before failing over
 - Wait for the estimated best slot time to failover
-- Wait for no leader slots in the near future (if things go sideways - make it hurt a little less by not being leader 😬)
+- Wait for no leader slots in the near future (if things go sideways — make it hurt a little less by not being leader 😬)
 - Post-failover vote credit rank monitoring
 - Pre/post failover hooks
 - Customizable validator client and set identity commands to support (most) any validator client
 
+## How it works
+
+Running `solana-validator-failover run` on either node **automatically detects the node's role** (active or passive) from gossip and does the right thing:
+
+- **Passive node** → starts a QUIC server, waits for the active node to connect
+- **Active node** → connects to the passive peer as a QUIC client and orchestrates the handover
+
+**You run the command on both nodes.** Start the passive node first so it is listening when the active node connects.
+
+![solana-validator-failover passive-to-active](vhs/failover-passive-to-active.gif)
+
+![solana-validator-failover active-to-passive](vhs/failover-active-to-passive.gif)
+
 ## Usage
 
 ```shell
-# on any node declared in solana-validator-failover.yaml
-# run the failover - a passive node will send a request to the active one to take over
-# By default it runs in dry-run mode, to run for real, run on the passive node with `--not-a-drill`
+# 1. Run on the passive node first — starts a server waiting for the active node
+solana-validator-failover run --not-a-drill
+
+# 2. Run on the active node — connects to the passive peer and initiates the handover
 solana-validator-failover run
 ```
 
-By default, `run` runs in dry-run mode where only the tower file is synced between nodes and set identity commands are mocked. This is to safeguard against fat fingers (we've all been there) and also to give an idea of the expected total failover time under current network conditions. When ready, re-run on the passive node with `--not-a-drill` to do it for realsies.
+By default, `run` executes in **dry-run mode**: the tower file is synced and all timings are recorded, but set-identity commands are not executed. This is useful for gauging failover speed under real network conditions without committing. Pass `--not-a-drill` on the **passive** node to execute for real.
 
-⚠️ WARNING: _who_ you run this program as matters - the user:
+> ⚠️ **Who you run this as matters.** The user must have:
+> - Permission to run set-identity commands for the validator
+> - Read/write permission on the tower file — verify inherited permissions after a dry-run
 
-- requires permissions to run set identity commands for the validator
-- requires permissions to read/write the tower file - check inherited tower file permissions are what you expect after a dry-run
+### Flags
+
+#### `run` flags
+
+| Flag                           | Default | Description                                                                                                                                                       |
+| ------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--not-a-drill`                | `false` | Execute failover for real. Effective on the passive node; ignored on the active node.                                                                             |
+| `--no-wait-for-healthy`        | `false` | Skip waiting for the node to report healthy at `<rpc_address>/health`.                                                                                            |
+| `--no-min-time-to-leader-slot` | `false` | Skip waiting for the active node to have no leader slots in the next `min_time_to_leader_slot` window. Effective on the active node; ignored on the passive node. |
+| `--skip-tower-sync`            | `false` | Skip syncing the tower file from active to passive. The passive node must not have an existing tower file.                                                        |
+| `-y, --yes`                    | `false` | Skip all interactive confirmation prompts.                                                                                                                        |
+| `--to-peer <name\|ip>`         | —       | When run on the active node, auto-select a peer by its configured name or IP address, skipping the interactive selector. Ignored on the passive node.             |
+
+#### Persistent flags
+
+| Flag                      | Default                                                      | Description                                   |
+| ------------------------- | ------------------------------------------------------------ | --------------------------------------------- |
+| `-c, --config <path>`     | `~/solana-validator-failover/solana-validator-failover.yaml` | Path to config file.                          |
+| `-l, --log-level <level>` | `info`                                                       | Log level (`debug`, `info`, `warn`, `error`). |
+
+### Peer selection
+
+The active node **always prompts you to select a peer**, even when only one is configured. Use `--to-peer <name|ip>` to skip the prompt — useful for scripted or non-interactive failovers:
+
+```shell
+# Skip peer selection prompt by name
+solana-validator-failover run --to-peer backup-validator-region-x
+
+# Fully non-interactive (skip peer selection and all confirmation prompts)
+solana-validator-failover run --to-peer backup-validator-region-x --yes
+```
 
 ## Installation
 
@@ -51,8 +88,9 @@ Build from source or download the built package for your system from the [releas
 
 ## Prerequisites
 
-1. A (_preferrably private_ and low-latency) UDP route between active and passive validators. Latency can vary lots across setups, so YMMV, though QUIC should give a good head start.
-2. Some focus and appreciation of what you're doing - these can be high pucker factor operations regardless of tooling.
+1. **A (preferably private) low-latency UDP route** between active and passive validators. Latency varies across setups, so YMMV, though QUIC should give a good head start.
+
+2. **Some focus and appreciation of what you're doing** — these can be high pucker factor operations regardless of tooling.
 
 ## Configuration
 
@@ -68,7 +106,9 @@ validator:
   #            any other value is treated as a custom cluster (requires cluster_rpc_url)
   cluster: mainnet-beta
 
-  # (required for custom clusters) cluster RPC URL
+  # (required for custom clusters) RPC URL for the cluster - must support getClusterNodes.
+  # For well-known clusters the built-in URL is used. For custom clusters, or if you need
+  # to override the default (e.g. to use a private RPC), set this explicitly.
   # cluster_rpc_url: <solana_compatible_rpc_endpoint>
 
   # average slot duration, used to estimate time to next leader slot
@@ -102,7 +142,7 @@ validator:
     # (required) directory hosting the tower file
     dir: /mnt/accounts/tower
 
-    # when passive, delete the towerfile if one exists before starting a failover server
+    # when passive, delete the tower file if one exists before starting a failover server
     # default: false
     auto_empty_when_passive: false
 
@@ -129,15 +169,16 @@ validator:
     set_identity_active_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Active.KeyFile }} --require-tower"
     set_identity_passive_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Passive.KeyFile }}"
 
-    # failover peers - keys are vanity hostnames to help you review program output better
+    # failover peers - keys are vanity names shown in program output and usable with --to-peer
+    # configure one peer per passive validator you may want to fail over to
     peers:
       backup-validator-region-x:
         # host and port to connect to failover server
         address: backup-validator-region-x.some-private.zone:9898
 
     # duration string representing the minimum amount of time before the active node is due to
-    # be the leader, if the failover is initiated below this threshold it will wait until this
-    # window has passed to begin failing over
+    # be the leader; if the failover is initiated below this threshold it will wait until this
+    # window has passed before connecting to the passive peer
     # default: 5m
     min_time_to_leader_slot: 5m
 
@@ -220,7 +261,7 @@ validator:
             environment: # optional map of custom environment variables (values support template interpolation)
               MY_VAR: "{{ .ThisNodeName }}"
               PEER_IP: "{{ .PeerNodePublicIP }}"
-      # hooks to run after failover - errors in post hooks displayed but do nothing
+      # hooks to run after failover - errors in post hooks are displayed but do not affect the failover result
       post:
         # run after failover when validator is active
         when_active:
