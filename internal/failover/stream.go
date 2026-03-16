@@ -1,20 +1,14 @@
 package failover
 
 import (
-	"bytes"
 	"context"
 	"encoding/gob"
 	"fmt"
-	"maps"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/lipgloss/table"
-	"github.com/dustin/go-humanize"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
@@ -26,13 +20,13 @@ import (
 // Stream is the message sent from the active node to the passive node (server) to initiate the failover process
 type Stream struct {
 	message Message
-	Stream  quic.Stream
+	Stream  *quic.Stream
 	decoder *gob.Decoder
 	encoder *gob.Encoder
 }
 
 // NewFailoverStream creates a new FailoverStream from a QUIC stream
-func NewFailoverStream(stream quic.Stream) *Stream {
+func NewFailoverStream(stream *quic.Stream) *Stream {
 	decoder := gob.NewDecoder(stream)
 	encoder := gob.NewEncoder(stream)
 
@@ -147,6 +141,27 @@ func (s Stream) GetIsSuccessfullyCompleted() bool {
 	return s.message.IsSuccessfullyCompleted
 }
 
+// SetRollbackRequired signals to the client that it must rollback its identity change.
+func (s *Stream) SetRollbackRequired(required bool) {
+	s.message.RollbackRequired = required
+}
+
+// GetRollbackRequired returns true if the server has signalled that a rollback is required.
+func (s Stream) GetRollbackRequired() bool {
+	return s.message.RollbackRequired
+}
+
+// SetActiveRollbackEnabled records whether the active node (client) has rollback configured.
+// Called by the client before sending its initial message so the server can detect mismatches.
+func (s *Stream) SetActiveRollbackEnabled(enabled bool) {
+	s.message.ActiveRollbackEnabled = enabled
+}
+
+// GetActiveRollbackEnabled returns whether the active node (client) has rollback configured.
+func (s Stream) GetActiveRollbackEnabled() bool {
+	return s.message.ActiveRollbackEnabled
+}
+
 // SetFailoverStartSlot sets the failover start slot
 func (s *Stream) SetFailoverStartSlot(failoverStartSlot uint64) {
 	s.message.FailoverStartSlot = failoverStartSlot
@@ -239,167 +254,33 @@ func (s *Stream) buildHookTemplateDataForPassiveNode(isPreFailover bool, rpcURL 
 // it shows confirmation message and waits for user to confirm. once confirmed
 // it allows the stream to proceed and the active node begins setting identity
 // and tower file sync
-func (s *Stream) ConfirmFailover(failoverHooks hooks.FailoverHooks, activeRPCURL, passiveRPCURL string) (err error) {
-	// Build template data for hooks
-	activePreTemplateData := s.buildHookTemplateDataForActiveNode(true, activeRPCURL)
-	activePostTemplateData := s.buildHookTemplateDataForActiveNode(false, activeRPCURL)
-	passivePreTemplateData := s.buildHookTemplateDataForPassiveNode(true, passiveRPCURL)
-	passivePostTemplateData := s.buildHookTemplateDataForPassiveNode(false, passiveRPCURL)
-
-	// Add custom function to split commands and render hooks
-	funcMap := template.FuncMap{
-		"splitCommand": func(cmd string) string {
-			// Split the command by spaces
-			parts := strings.Fields(cmd)
-			if len(parts) == 0 {
-				return ""
-			}
-			// Join with newlines and proper indentation
-			return parts[0] + " \\\n      " + strings.Join(parts[1:], " \\\n      ")
-		},
-		"RenderSetIdentityCommand": func(cmd string, isDryRun bool) string {
-			prefixSartString := hooks.PrefixStyle.Render("[set-identity")
-			dryRunString := ""
-			if isDryRun {
-				dryRunString = style.RenderLightBlueString(" (dry run)")
-			}
-			prefixEndString := hooks.PrefixStyle.Render("]:")
-
-			return fmt.Sprintf("%s%s%s %s", prefixSartString, dryRunString, prefixEndString, hooks.PrefixStyle.Render(cmd))
-		},
-		"RenderTowerFileSyncCommand": func(cmd string) string {
-			prefixSartString := hooks.PrefixStyle.Render("[destination]:")
-			return fmt.Sprintf("%s %s", prefixSartString, hooks.PrefixStyle.Render(cmd))
-		},
-		"RenderHooks": func(hooksList hooks.Hooks, nodeName string, hookType string) string {
-			if len(hooksList) == 0 {
-				return ""
-			}
-			var result strings.Builder
-			var templateData hooks.HookTemplateData
-
-			// Select appropriate template data based on node and hook type
-			if nodeName == s.message.ActiveNodeInfo.Hostname {
-				if hookType == "pre" {
-					templateData = activePreTemplateData
-				} else {
-					templateData = activePostTemplateData
-				}
-			} else {
-				if hookType == "pre" {
-					templateData = passivePreTemplateData
-				} else {
-					templateData = passivePostTemplateData
-				}
-			}
-
-			for i, hook := range hooksList {
-				hookCmd, err := hooks.RenderHookCommand(hook, templateData)
-				if err != nil {
-					// If rendering fails, fall back to original command
-					hookCmd = hook.Command
-					if len(hook.Args) > 0 {
-						hookCmd += " " + strings.Join(hook.Args, " ")
-					}
-				}
-
-				hookIndex := i + 1
-				prefixStartString := fmt.Sprintf("[%d/%d %s", hookIndex, len(hooksList), hook.Name)
-				mustSucceedString := ""
-				if hook.MustSucceed {
-					mustSucceedString = " (must succeed)"
-				}
-				prefixEndString := "]:"
-				styledHookString := fmt.Sprintf("%s%s%s %s",
-					hooks.PrefixStyle.Render(prefixStartString),
-					style.RenderLightWarningString(mustSucceedString),
-					hooks.PrefixStyle.Render(prefixEndString),
-					hooks.PrefixStyle.Render(hookCmd))
-
-				result.WriteString(fmt.Sprintf(" ↓   %s", styledHookString))
-				if i < len(hooksList)-1 {
-					result.WriteString(" ↓\n")
-				}
-			}
-			return result.String()
-		},
+func (s *Stream) ConfirmFailover(failoverHooks hooks.FailoverHooks, rollback hooks.RollbackConfig, activeRPCURL, passiveRPCURL string, autoConfirm bool) (err error) {
+	data := PlanData{
+		IsDryRun:            s.message.IsDryRunFailover,
+		SkipTowerSync:       s.message.SkipTowerSync,
+		ActiveNodeInfo:      s.message.ActiveNodeInfo,
+		PassiveNodeInfo:     s.message.PassiveNodeInfo,
+		AppVersion:          pkgconstants.AppVersion,
+		Hooks:               failoverHooks,
+		Rollback:            rollback,
+		ActivePreHookData:   s.buildHookTemplateDataForActiveNode(true, activeRPCURL),
+		ActivePostHookData:  s.buildHookTemplateDataForActiveNode(false, activeRPCURL),
+		PassivePreHookData:  s.buildHookTemplateDataForPassiveNode(true, passiveRPCURL),
+		PassivePostHookData: s.buildHookTemplateDataForPassiveNode(false, passiveRPCURL),
 	}
 
-	// Merge with existing style functions
-	maps.Copy(funcMap, style.TemplateFuncMap())
-
-	tpl := template.New("confirmFailoverTpl").Funcs(funcMap)
-	tpl, err = tpl.Parse(`{{ Purple "solana-validator-failover v" }}{{ Purple .AppVersion }}
-
-{{ Purple "Current state:" }}
-
-{{ .SummaryTable }}
-
-{{ Purple "Failover plan:" }}
-
-{{/* Clear warning when not a drill i.e not a dry run */}}
-{{- if .IsDryRun -}}
-{{ Blue "This is a dry run - re-run with '--not-a-drill' for a real failover," }}
-{{- else -}}
-{{ Warning "⚠️  This is a real failover - identities will be changed on both nodes." }}
-{{- end }}
-{{ if .Hooks.Pre.WhenActive }}
-🪝  {{ .ActiveNodeInfo.Hostname }} → {{ Active "pre-passive" false }} hooks
-{{ RenderHooks .Hooks.Pre.WhenActive .ActiveNodeInfo.Hostname "pre" }}
- ↓
-{{- end }}
-🔴 {{ Active .ActiveNodeInfo.Hostname false }} → {{ Passive "PASSIVE" false }} {{ Passive .ActiveNodeInfo.Identities.Passive.PubKey false }}
- ↓   {{ RenderSetIdentityCommand .ActiveNodeInfo.SetIdentityCommand .IsDryRun }} 
-{{- if not .SkipTowerSync }}
- ↓
-🔁 {{ LightGrey "tower-file" }} {{ LightGrey .ActiveNodeInfo.Hostname }} → {{ LightGrey .PassiveNodeInfo.Hostname }} 
- ↓   {{ RenderTowerFileSyncCommand .ActiveNodeInfo.TowerFile }}
-{{- end }}
-{{- if .Hooks.Pre.WhenPassive }}
- ↓
-🪝  {{ .PassiveNodeInfo.Hostname }} → {{ Passive "pre-active" false }} hooks
-{{ RenderHooks .Hooks.Pre.WhenPassive .PassiveNodeInfo.Hostname "pre" }}
- ↓
-{{- else }}
-{{- if not .SkipTowerSync }}
- ↓
-{{- end }}
-{{- end }}
-🟢 {{ Passive .PassiveNodeInfo.Hostname false }} → {{ Active "ACTIVE" false }} {{ Active .PassiveNodeInfo.Identities.Active.PubKey false }} 
- ↓   {{ RenderSetIdentityCommand .PassiveNodeInfo.SetIdentityCommand .IsDryRun }} 
-{{- if .Hooks.Post.WhenActive }}
- ↓
-🪝  {{ .PassiveNodeInfo.Hostname }} → {{ Active "post-active" false }} hooks
-{{ RenderHooks .Hooks.Post.WhenActive .PassiveNodeInfo.Hostname "post" }}
-{{- end }}
-{{- if .Hooks.Post.WhenPassive }}
- ↓
-🪝  {{ .ActiveNodeInfo.Hostname }} → {{ Passive "post-passive" false }} hooks
-{{ RenderHooks .Hooks.Post.WhenPassive .ActiveNodeInfo.Hostname "post" }}
-{{- end }}
- ↓
-💰 {{ LightGrey "Profit" }}
-`)
-
+	rendered, err := RenderFailoverPlan(data)
 	if err != nil {
-		return fmt.Errorf("failed to parse template: %w", err)
+		return err
 	}
 
-	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, map[string]any{
-		"IsDryRun":        s.message.IsDryRunFailover,
-		"SkipTowerSync":   s.message.SkipTowerSync,
-		"PassiveNodeInfo": s.message.PassiveNodeInfo,
-		"ActiveNodeInfo":  s.message.ActiveNodeInfo,
-		"SummaryTable":    s.message.currentStateTableString(),
-		"AppVersion":      pkgconstants.AppVersion,
-		"Hooks":           failoverHooks,
-	}); err != nil {
-		return fmt.Errorf("failed to execute template: %w", err)
-	}
+	fmt.Print(style.RenderMessageString(strings.Trim(rendered, "\n")))
+	fmt.Println()
 
-	// print confirm message
-	fmt.Println(style.RenderMessageString(buf.String()))
+	if autoConfirm {
+		log.Warn().Msg("--yes flag set, automatically proceeding with failover")
+		return nil
+	}
 
 	var confirmFailover bool
 	// ask to proceed
@@ -433,80 +314,26 @@ func (s *Stream) GetFailoverSlotsDuration() uint64 {
 	return s.GetFailoverEndSlot() - s.GetFailoverStartSlot()
 }
 
-// GetStateTable returns the state table
-func (s *Stream) GetStateTable() string {
-	return s.message.currentStateTableString()
-}
+// BuildSummaryData builds a SummaryData from the current stream message state.
+// Call this after the failover is complete and all timing fields are set.
+func (s *Stream) BuildSummaryData() SummaryData {
+	return SummaryData{
+		IsDryRun:      s.message.IsDryRunFailover,
+		SkipTowerSync: s.message.SkipTowerSync,
 
-// GetFailoverDurationTableString returns the failover duration table string
-func (s *Stream) GetFailoverDurationTableString() string {
-	rows := [][]string{
-		{
-			formatStageColumnRows(
-				[]string{
-					style.RenderActiveString(s.message.ActiveNodeInfo.Hostname, false),
-					style.RenderGreyString("--set-identity-->", false),
-					style.RenderPassiveString(s.message.ActiveNodeInfo.Identities.Passive.PubKey(), false),
-				},
-			)[0],
-			s.message.ActiveNodeSetIdentityEndTime.Sub(s.message.ActiveNodeSetIdentityStartTime).String(),
-			humanize.Comma(int64(s.GetFailoverStartSlot())),
-		},
+		OrigActiveNode:  s.message.ActiveNodeInfo,
+		OrigPassiveNode: s.message.PassiveNodeInfo,
+
+		OrigActiveSetIdentityDuration:  s.message.ActiveNodeSetIdentityEndTime.Sub(s.message.ActiveNodeSetIdentityStartTime),
+		TowerSyncDuration:              s.message.PassiveNodeSyncTowerFileEndTime.Sub(s.message.ActiveNodeSyncTowerFileStartTime),
+		TowerFileSizeBytes:             int64(len(s.message.ActiveNodeInfo.TowerFileBytes)),
+		OrigPassiveSetIdentityDuration: s.message.PassiveNodeSetIdentityEndTime.Sub(s.message.PassiveNodeSetIdentityStartTime),
+		TotalDuration:                  s.GetFailoverDuration(),
+
+		FailoverStartSlot: s.message.FailoverStartSlot,
+		FailoverEndSlot:   s.message.FailoverEndSlot,
+		SlotsDuration:     s.GetFailoverSlotsDuration(),
 	}
-
-	// Only add tower file sync row if not skipping
-	if !s.message.SkipTowerSync {
-		rows = append(rows, []string{
-			formatStageColumnRows(
-				[]string{
-					style.RenderGreyString(s.message.ActiveNodeInfo.Hostname, false),
-					style.RenderGreyString("---tower-file--->", false),
-					style.RenderGreyString(s.message.PassiveNodeInfo.Hostname, false),
-				},
-			)[0],
-			fmt.Sprintf("%s (%s)",
-				s.message.PassiveNodeSyncTowerFileEndTime.Sub(s.message.ActiveNodeSyncTowerFileStartTime).String(),
-				humanize.Bytes(uint64(len(s.message.ActiveNodeInfo.TowerFileBytes))),
-			),
-			" ",
-		})
-	}
-
-	// Add passive node set identity row
-	rows = append(rows, []string{
-		formatStageColumnRows(
-			[]string{
-				style.RenderPassiveString(s.message.PassiveNodeInfo.Hostname, false),
-				style.RenderGreyString("--set-identity-->", false),
-				style.RenderActiveString(s.message.PassiveNodeInfo.Identities.Active.PubKey(), false),
-			},
-		)[0],
-		s.message.PassiveNodeSetIdentityEndTime.Sub(s.message.PassiveNodeSetIdentityStartTime).String(),
-		humanize.Comma(int64(s.GetFailoverEndSlot())),
-	})
-
-	// Add total row
-	totalRowIndex := len(rows)
-	rows = append(rows, []string{
-		style.RenderBoldMessage("Total"),
-		fmt.Sprintf("%s (wall clock)", style.RenderBoldMessage(s.GetFailoverDuration().String())),
-		style.RenderBoldMessage(fmt.Sprintf("%s slots", humanize.Comma(int64(s.GetFailoverSlotsDuration())))),
-	})
-
-	return style.RenderTable(
-		[]string{"Stage", "Duration", "Slot"},
-		rows,
-		func(row, col int) lipgloss.Style {
-			if row == table.HeaderRow {
-				return style.TableHeaderStyle
-			}
-			// total stage title
-			if row == totalRowIndex && col == 0 {
-				return style.TableCellStyle.Align(lipgloss.Right)
-			}
-			return style.TableCellStyle.Align(lipgloss.Left)
-		},
-	)
 }
 
 // SetActiveNodeSetIdentityStartTime sets the active node set identity start time
@@ -546,7 +373,7 @@ func (s *Stream) SetPassiveNodeSyncTowerFileEndTime() {
 
 // PullActiveIdentityVoteCreditsSample pulls a sample of the vote credits for the active identity
 func (s *Stream) PullActiveIdentityVoteCreditsSample(solanaRPCClient solana.ClientInterface) (err error) {
-	identityPubkey := s.message.ActiveNodeInfo.Identities.Active.Key.PublicKey().String()
+	identityPubkey := s.message.ActiveNodeInfo.Identities.Active.PubKey()
 
 	// fetch current state of vote account from its pubkey
 	voteAccount, creditRank, err := solanaRPCClient.GetCreditRankedVoteAccountFromPubkey(identityPubkey)
@@ -642,45 +469,4 @@ func (s *Stream) GetVoteCreditRankDifference() (difference, first, last int, err
 	difference = last - first
 	// invert the difference (lower number is better)
 	return -1 * difference, first, last, nil
-}
-
-// formatStageColumnRows formats the stage column rows
-// each row is a slice of strings representing 3 columns
-// that must be padded to all have the same length
-func formatStageColumnRows(rows ...[]string) (formattedRows []string) {
-	maxColumnLengths := []int{0, 0, 0}
-	formattedRows = make([]string, len(rows))
-
-	// get the longest string length of each column
-	for _, row := range rows {
-		// for each row get the longest string length of each column
-		if len(row[0]) > maxColumnLengths[0] {
-			maxColumnLengths[0] = len(row[0])
-		}
-		if len(row[1]) > maxColumnLengths[1] {
-			maxColumnLengths[1] = len(row[1])
-		}
-		if len(row[2]) > maxColumnLengths[2] {
-			maxColumnLengths[2] = len(row[2])
-		}
-	}
-
-	// pad each column to the longest string length
-	for rowIndex, row := range rows {
-		col1Value := row[0]
-		col2Value := row[1]
-		col3Value := row[2]
-
-		col1Style := lipgloss.NewStyle().PaddingRight(maxColumnLengths[0] - len(col1Value))
-		col2Style := lipgloss.NewStyle().PaddingRight(maxColumnLengths[1] - len(col2Value))
-		col3Style := lipgloss.NewStyle().PaddingRight(maxColumnLengths[2] - len(col3Value))
-
-		formattedRows[rowIndex] = fmt.Sprintf("%s %s %s",
-			col1Style.Render(col1Value),
-			col2Style.Render(col2Value),
-			col3Style.Render(col3Value),
-		)
-	}
-
-	return formattedRows
 }

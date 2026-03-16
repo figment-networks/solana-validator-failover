@@ -2,8 +2,10 @@ package validator
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"fmt"
 	"html/template"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +32,9 @@ type FailoverParams struct {
 	NoMinTimeToLeaderSlot bool
 	MinTimeToLeaderSlot   time.Duration
 	SkipTowerSync         bool
+	AutoConfirm           bool   // -y/--yes: skip all interactive confirmations
+	ToPeer                string // --to-peer: auto-select peer by name or IP (active node only)
+	RollbackEnabled       bool   // --rollback-enabled/-r: force-enable rollback regardless of config
 }
 
 // Peers is a map of peers
@@ -66,9 +71,12 @@ type Validator struct {
 	SetIdentityPassiveCommand      string
 	TowerFile                      string
 	TowerFileAutoDeleteWhenPassive bool
+	Rollback                       hooks.RollbackConfig
 
 	logger          zerolog.Logger
 	solanaRPCClient solana.ClientInterface
+	serverTLSConfig *gotls.Config // non-nil when mTLS is enabled; used by the passive QUIC server
+	clientTLSConfig *gotls.Config // non-nil when mTLS is enabled; used by the active QUIC client
 }
 
 // NewSolanaRPCClient creates a new Solana RPC client
@@ -97,7 +105,7 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	defer v.logger.Debug().Msg("configuration done")
 
 	// configure solana rpc clients all in one
-	err := v.configureRPCClient(cfg.RPCAddress, cfg.Cluster)
+	err := v.configureRPCClient(cfg.RPCAddress, cfg.Cluster, cfg.ClusterRPCURL, cfg.AverageSlotDuration)
 	if err != nil {
 		return err
 	}
@@ -138,6 +146,12 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 		return err
 	}
 
+	// configure rollback
+	err = v.configureRollback(cfg.Failover)
+	if err != nil {
+		return err
+	}
+
 	// must have at least one peer, each peer must have a valid string <host>:<port>
 	err = v.configurePeers(cfg.Failover.Peers)
 	if err != nil {
@@ -157,7 +171,7 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	}
 
 	// get hostname
-	err = v.configureHostname(cfg.Hostname)
+	err = v.configureHostname(cfg.Name)
 	if err != nil {
 		return err
 	}
@@ -170,6 +184,12 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 
 	// get server
 	err = v.configureServer(cfg.Failover.Server, cfg.Failover.Monitor)
+	if err != nil {
+		return err
+	}
+
+	// configure mTLS (no-op when tls.enabled is false)
+	err = v.configureTLS(cfg.Failover.TLS)
 	if err != nil {
 		return err
 	}
@@ -206,19 +226,33 @@ func (v *Validator) Failover(params FailoverParams) (err error) {
 
 	params.MinTimeToLeaderSlot = v.MinimumTimeToLeaderSlot
 
+	if params.RollbackEnabled && !v.Rollback.Enabled {
+		log.Debug().Msg("--rollback-enabled flag set: overriding rollback.enabled to true")
+		v.Rollback.Enabled = true
+	}
+
 	if v.IsActive() {
+		if params.AutoConfirm && params.ToPeer != "" {
+			log.Warn().Msg("non-interactive mode: --yes and --to-peer are both set, all prompts will be skipped")
+		}
+		if params.AutoConfirm {
+			// --yes has no confirmations to skip on the active path, but it's not an error
+			log.Debug().Msg("--yes flag set (active node: no confirmations in this path)")
+		}
 		return v.makePassive(params)
 	}
 
+	// passive node path
+	if params.ToPeer != "" {
+		log.Warn().Str("to_peer", params.ToPeer).Msg("--to-peer flag is only applicable when run on an active node - ignoring")
+	}
 	return v.makeActive(params)
 }
 
 // configureRPCClient configures the solana rpc client
-func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName string) error {
-	// configure solana rpc clients all in one
-	err := utils.ValidateCluster(solanaClusterName)
-	if err != nil {
-		return err
+func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName, clusterRPCURL, averageSlotDuration string) error {
+	if solanaClusterName == "" {
+		return fmt.Errorf("cluster is required")
 	}
 
 	if !utils.IsValidURLWithPort(localRPCURL) {
@@ -228,18 +262,38 @@ func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName string) er
 		)
 	}
 
-	solanaClusterRPCURL := constants.SolanaClusters[solanaClusterName].RPC
+	// determine the cluster RPC URL: use built-in URL for known clusters,
+	// otherwise require cluster_rpc_url from config
+	var solanaClusterRPCURL string
+	if utils.IsKnownCluster(solanaClusterName) {
+		solanaClusterRPCURL = constants.SolanaClusters[solanaClusterName].RPC
+	} else {
+		if clusterRPCURL == "" {
+			return fmt.Errorf(
+				"cluster_rpc_url is required for custom cluster %q (known clusters: %s)",
+				solanaClusterName,
+				strings.Join(constants.SolanaClusterNames, ", "),
+			)
+		}
+		solanaClusterRPCURL = clusterRPCURL
+	}
+
+	avgSlotDuration, err := time.ParseDuration(averageSlotDuration)
+	if err != nil {
+		return fmt.Errorf("invalid average_slot_duration %q: %w", averageSlotDuration, err)
+	}
 
 	v.logger.Debug().
 		Str("cluster", solanaClusterName).
 		Str("local_rpc_url", localRPCURL).
-		Str("network_rpc_url", solanaClusterRPCURL).
+		Str("cluster_rpc_url", solanaClusterRPCURL).
 		Msg("rpc client configured")
 
 	v.RPCAddress = localRPCURL
 	v.solanaRPCClient = v.NewSolanaRPCClient(solana.NewClientParams{
-		LocalRPCURL:   localRPCURL,
-		NetworkRPCURL: solanaClusterRPCURL,
+		LocalRPCURL:         localRPCURL,
+		ClusterRPCURL:       solanaClusterRPCURL,
+		AverageSlotDuration: avgSlotDuration,
 	})
 
 	return nil
@@ -408,8 +462,70 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 func (v *Validator) configureHooks(cfg FailoverConfig) (err error) {
 	v.Hooks = cfg.Hooks
 	v.logger.Debug().
-		Interface("hooks", v.Hooks).
+		Int("pre_when_active", len(v.Hooks.Pre.WhenActive)).
+		Int("pre_when_passive", len(v.Hooks.Pre.WhenPassive)).
+		Int("post_when_active", len(v.Hooks.Post.WhenActive)).
+		Int("post_when_passive", len(v.Hooks.Post.WhenPassive)).
 		Msg("hooks set")
+	for _, h := range v.Hooks.Pre.WhenActive {
+		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  pre hook (when active)")
+	}
+	for _, h := range v.Hooks.Pre.WhenPassive {
+		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  pre hook (when passive)")
+	}
+	for _, h := range v.Hooks.Post.WhenActive {
+		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  post hook (when active)")
+	}
+	for _, h := range v.Hooks.Post.WhenPassive {
+		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  post hook (when passive)")
+	}
+	return nil
+}
+
+// configureRollback resolves rollback command templates and stores the fully-expanded
+// rollback commands alongside any configured rollback hooks.
+// If a cmd_template is empty, it falls back to the corresponding set-identity command.
+func (v *Validator) configureRollback(cfg FailoverConfig) error {
+	v.Rollback.Enabled = cfg.Rollback.Enabled
+	v.Rollback.ToActive.Hooks = cfg.Rollback.ToActive.Hooks
+	v.Rollback.ToPassive.Hooks = cfg.Rollback.ToPassive.Hooks
+
+	// resolve to-active rollback command
+	if cfg.Rollback.ToActive.CmdTemplate == "" {
+		v.Rollback.ToActive.ResolvedCmd = v.SetIdentityActiveCommand
+	} else {
+		tpl, err := template.New("rollback_to_active_cmd").Parse(cfg.Rollback.ToActive.CmdTemplate)
+		if err != nil {
+			return fmt.Errorf("failed to parse rollback.to_active.cmd_template: %w", err)
+		}
+		var buf strings.Builder
+		if err := tpl.Execute(&buf, v); err != nil {
+			return fmt.Errorf("failed to execute rollback.to_active.cmd_template: %w", err)
+		}
+		v.Rollback.ToActive.ResolvedCmd = buf.String()
+	}
+
+	// resolve to-passive rollback command
+	if cfg.Rollback.ToPassive.CmdTemplate == "" {
+		v.Rollback.ToPassive.ResolvedCmd = v.SetIdentityPassiveCommand
+	} else {
+		tpl, err := template.New("rollback_to_passive_cmd").Parse(cfg.Rollback.ToPassive.CmdTemplate)
+		if err != nil {
+			return fmt.Errorf("failed to parse rollback.to_passive.cmd_template: %w", err)
+		}
+		var buf strings.Builder
+		if err := tpl.Execute(&buf, v); err != nil {
+			return fmt.Errorf("failed to execute rollback.to_passive.cmd_template: %w", err)
+		}
+		v.Rollback.ToPassive.ResolvedCmd = buf.String()
+	}
+
+	v.logger.Debug().
+		Bool("enabled", v.Rollback.Enabled).
+		Str("to_active_cmd", v.Rollback.ToActive.ResolvedCmd).
+		Str("to_passive_cmd", v.Rollback.ToPassive.ResolvedCmd).
+		Msg("rollback configured")
+
 	return nil
 }
 
@@ -490,24 +606,20 @@ func (v *Validator) GetHostname() (string, error) {
 	return os.Hostname()
 }
 
-// configureHostname ensures the hostname is valid and sets it
-func (v *Validator) configureHostname(hostname string) (err error) {
-	if hostname != "" {
-		v.Hostname = hostname
-		v.logger.Debug().
-			Str("hostname", v.Hostname).
-			Msg("hostname set in config")
+// configureHostname sets the node's display name from validator.name if provided,
+// otherwise falls back to the OS hostname.
+func (v *Validator) configureHostname(name string) (err error) {
+	if name != "" {
+		v.Hostname = name
+		v.logger.Debug().Str("name", v.Hostname).Msg("name set from config")
 		return nil
 	}
 
-	hostname, err = v.GetHostname()
+	v.Hostname, err = v.GetHostname()
 	if err != nil {
 		return err
 	}
-	v.Hostname = hostname
-	v.logger.Debug().
-		Str("hostname", v.Hostname).
-		Msg("hostname set")
+	v.logger.Debug().Str("hostname", v.Hostname).Msg("hostname set from OS")
 	return nil
 }
 
@@ -539,6 +651,59 @@ func (v *Validator) configureServer(cfg ServerConfig, monitorCfg MonitorConfig) 
 		Int("credit_samples_count", v.MonitorConfig.CreditSamples.Count).
 		Str("credit_samples_interval", v.MonitorConfig.CreditSamples.Interval).
 		Msg("server and monitor config set")
+	return nil
+}
+
+// configureTLS validates and loads mTLS material when tls.enabled is true.
+// When disabled (the default), it is a no-op and the QUIC layer falls back
+// to an ephemeral self-signed certificate (encrypted but unauthenticated).
+func (v *Validator) configureTLS(cfg TLSConfig) error {
+	if !cfg.Enabled {
+		v.logger.Debug().Msg("mTLS disabled; QUIC connections use an ephemeral self-signed certificate (encrypted but unauthenticated)")
+		return nil
+	}
+
+	if cfg.CACert == "" {
+		return fmt.Errorf("tls.ca_cert is required when tls.enabled is true")
+	}
+	if cfg.Cert == "" {
+		return fmt.Errorf("tls.cert is required when tls.enabled is true")
+	}
+	if cfg.Key == "" {
+		return fmt.Errorf("tls.key is required when tls.enabled is true")
+	}
+
+	caCertPath, err := utils.ResolvePath(cfg.CACert)
+	if err != nil {
+		return fmt.Errorf("tls.ca_cert: failed to resolve path: %w", err)
+	}
+	certPath, err := utils.ResolvePath(cfg.Cert)
+	if err != nil {
+		return fmt.Errorf("tls.cert: failed to resolve path: %w", err)
+	}
+	keyPath, err := utils.ResolvePath(cfg.Key)
+	if err != nil {
+		return fmt.Errorf("tls.key: failed to resolve path: %w", err)
+	}
+
+	serverTLS, err := utils.BuildMTLSServerConfig(caCertPath, certPath, keyPath)
+	if err != nil {
+		return fmt.Errorf("tls: failed to build server TLS config: %w", err)
+	}
+
+	clientTLS, err := utils.BuildMTLSClientConfig(caCertPath, certPath, keyPath)
+	if err != nil {
+		return fmt.Errorf("tls: failed to build client TLS config: %w", err)
+	}
+
+	v.serverTLSConfig = serverTLS
+	v.clientTLSConfig = clientTLS
+
+	v.logger.Info().
+		Str("ca_cert", caCertPath).
+		Str("cert", certPath).
+		Msg("mTLS enabled: certificate and CA loaded successfully")
+
 	return nil
 }
 
@@ -592,13 +757,17 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 
 	// if the tower file exists and auto empty when passive is false, confirm if you want it deleted and exit if not.
 	if !v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
-		log.Warn().Msgf("Tower file exists %s", v.TowerFile)
-		confirm, err := confirm("Delete tower file and proceed?")
-		if err != nil {
-			return err
-		}
-		if !confirm {
-			return fmt.Errorf("cancelled")
+		log.Warn().Str("tower_file", v.TowerFile).Msg("tower file exists")
+		if params.AutoConfirm {
+			log.Warn().Str("tower_file", v.TowerFile).Msg("--yes flag set, automatically deleting tower file")
+		} else {
+			confirmed, err := confirm("Delete tower file and proceed?")
+			if err != nil {
+				return err
+			}
+			if !confirmed {
+				return fmt.Errorf("cancelled")
+			}
 		}
 		// delete the tower file
 		if err = utils.RemoveFile(v.TowerFile); err != nil {
@@ -625,7 +794,10 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		RPCURL:           v.RPCAddress,
 		IsDryRunFailover: !params.NotADrill,
 		Hooks:            v.Hooks,
+		Rollback:         v.Rollback,
 		SkipTowerSync:    params.SkipTowerSync,
+		AutoConfirm:      params.AutoConfirm,
+		TLSConfig:        v.serverTLSConfig,
 		MonitorConfig: failover.MonitorConfig{
 			CreditSamples: failover.CreditSamplesConfig{
 				Count:            v.MonitorConfig.CreditSamples.Count,
@@ -666,7 +838,7 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 	}
 
 	// select passive peer to connect to from declared peers
-	selectedPassivePeer, err := v.selectPassivePeer()
+	selectedPassivePeer, err := v.selectPassivePeer(params)
 	if err != nil {
 		return err
 	}
@@ -685,12 +857,15 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 			PublicIP:                       v.PublicIP,
 			Identities:                     v.Identities,
 			TowerFile:                      v.TowerFile,
+			TowerFileSizeBytes:             utils.FileSize(v.TowerFile),
 			SetIdentityCommand:             v.SetIdentityPassiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
 			SolanaValidatorFailoverVersion: pkgconstants.AppVersion,
 			RPCAddress:                     v.RPCAddress,
 		},
-		Hooks: v.Hooks,
+		Hooks:     v.Hooks,
+		Rollback:  v.Rollback,
+		TLSConfig: v.clientTLSConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to peer %s: %w", selectedPassivePeer.Name, err)
@@ -733,8 +908,36 @@ func (v *Validator) waitUntilHealthy() (err error) {
 	return sp.Run()
 }
 
-// selectPassivePeer allows selection of a peer from the list of peers
-func (v *Validator) selectPassivePeer() (selectedPeer Peer, err error) {
+// selectPassivePeer allows selection of a peer from the list of peers.
+// When params.ToPeer is set, it auto-selects by name or IP without an interactive prompt.
+func (v *Validator) selectPassivePeer(params FailoverParams) (selectedPeer Peer, err error) {
+	if params.ToPeer != "" {
+		// match by name first
+		if peer, ok := v.Peers[params.ToPeer]; ok {
+			log.Info().
+				Str("peer", peer.Name).
+				Str("address", peer.Address).
+				Msg("--to-peer: auto-selected peer by name")
+			return peer, nil
+		}
+		// match by IP (Address is "host:port")
+		for _, peer := range v.Peers {
+			host, _, splitErr := net.SplitHostPort(peer.Address)
+			if splitErr != nil {
+				continue
+			}
+			if host == params.ToPeer {
+				log.Info().
+					Str("peer", peer.Name).
+					Str("address", peer.Address).
+					Msg("--to-peer: auto-selected peer by IP")
+				return peer, nil
+			}
+		}
+		return selectedPeer, fmt.Errorf("--to-peer: no peer found matching %q (checked names and IP addresses)", params.ToPeer)
+	}
+
+	// no --to-peer: fall back to interactive selector
 	huhPeerOptions := make([]huh.Option[string], 0)
 	for name, peer := range v.Peers {
 		selectionKey := style.RenderPassiveString(name, false)

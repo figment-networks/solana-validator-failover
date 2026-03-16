@@ -2,6 +2,7 @@ package solana
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,9 +10,14 @@ import (
 
 	solanago "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/gagliardetto/solana-go/rpc/jsonrpc"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+// jsonRPCMethodNotFound is the standard JSON-RPC 2.0 error code for "Method not found".
+// See: https://www.jsonrpc.org/specification#error_object
+const jsonRPCMethodNotFound = -32601
 
 // RPCClientInterface defines the interface for RPC client operations - a solana rpc client interface
 type RPCClientInterface interface {
@@ -29,6 +35,12 @@ type ClientInterface interface {
 	NodeFromIP(ip string) (*Node, error)
 	// NodeFromPubkey returns a Node from a pubkey
 	NodeFromPubkey(pubkey string) (*Node, error)
+	// NodeFromIPWithExpectedPubkey returns a Node from an IP address, preferring the entry
+	// whose pubkey matches expectedPubkey. During a gossip identity transition, both the old
+	// and new CRDS entries for a node briefly coexist; this method returns the expected entry
+	// if present, falling back to the first entry for the IP otherwise. Returns an error only
+	// if no entry exists for the IP at all.
+	NodeFromIPWithExpectedPubkey(ip, expectedPubkey string) (*Node, error)
 	// GetCreditRankedVoteAccountFromPubkey returns the credit rank-sorted current vote accounts rank is the difference
 	// between current epoch credits and total credits (descending)
 	GetCreditRankedVoteAccountFromPubkey(pubkey string) (*rpc.VoteAccountsResult, int, error)
@@ -44,25 +56,32 @@ type ClientInterface interface {
 
 // Client implements Interface using an RPC client
 type Client struct {
-	localRPCClient   RPCClientInterface
-	networkRPCClient RPCClientInterface
-	loggerLocal      zerolog.Logger
-	loggerNetwork    zerolog.Logger
+	localRPCClient      RPCClientInterface
+	networkRPCClient    RPCClientInterface
+	loggerLocal         zerolog.Logger
+	loggerNetwork       zerolog.Logger
+	averageSlotDuration time.Duration
 }
 
 // NewClientParams is the parameters for creating a new client
 type NewClientParams struct {
-	LocalRPCURL   string
-	NetworkRPCURL string
+	LocalRPCURL         string
+	ClusterRPCURL       string
+	AverageSlotDuration time.Duration // average slot duration, defaults to 400ms
 }
 
 // NewRPCClient creates a new client for the given solana cluster
 func NewRPCClient(params NewClientParams) ClientInterface {
+	avgSlotDuration := params.AverageSlotDuration
+	if avgSlotDuration <= 0 {
+		avgSlotDuration = 400 * time.Millisecond
+	}
 	return &Client{
-		localRPCClient:   rpc.New(params.LocalRPCURL),
-		networkRPCClient: rpc.New(params.NetworkRPCURL),
-		loggerLocal:      log.Logger.With().Str("rpc_client", "local").Logger(),
-		loggerNetwork:    log.Logger.With().Str("rpc_client", "network").Logger(),
+		localRPCClient:      rpc.New(params.LocalRPCURL),
+		networkRPCClient:    rpc.New(params.ClusterRPCURL),
+		loggerLocal:         log.Logger.With().Str("rpc_client", "local").Logger(),
+		loggerNetwork:       log.Logger.With().Str("rpc_client", "network").Logger(),
+		averageSlotDuration: avgSlotDuration,
 	}
 }
 
@@ -107,8 +126,24 @@ func (c *Client) NodeFromPubkey(pubkey string) (*Node, error) {
 	return &Node{gossipNode: gossipNode}, nil
 }
 
+func (c *Client) getClusterNodes() ([]*rpc.GetClusterNodesResult, error) {
+	nodes, err := c.localRPCClient.GetClusterNodes(context.Background())
+	if err != nil {
+		return nil, wrapGetClusterNodesErr(err)
+	}
+	return nodes, nil
+}
+
+func wrapGetClusterNodesErr(err error) error {
+	var rpcErr *jsonrpc.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == jsonRPCMethodNotFound {
+		return fmt.Errorf("%w; start the local validator with --full-rpc-api to enable getClusterNodes", err)
+	}
+	return err
+}
+
 func (c *Client) nodeFromIP(ip string) (node *rpc.GetClusterNodesResult, err error) {
-	nodes, err := c.networkRPCClient.GetClusterNodes(context.Background())
+	nodes, err := c.getClusterNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +161,7 @@ func (c *Client) nodeFromIP(ip string) (node *rpc.GetClusterNodesResult, err err
 }
 
 func (c *Client) gossipNodeFromPubkey(pubkey string) (node *rpc.GetClusterNodesResult, err error) {
-	nodes, err := c.networkRPCClient.GetClusterNodes(context.Background())
+	nodes, err := c.getClusterNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +173,49 @@ func (c *Client) gossipNodeFromPubkey(pubkey string) (node *rpc.GetClusterNodesR
 	}
 
 	return nil, fmt.Errorf("gossip node not found for pubkey: %s", pubkey)
+}
+
+// NodeFromIPWithExpectedPubkey returns a Node from an IP address, preferring the entry
+// whose pubkey matches expectedPubkey. During a gossip identity transition, both the old
+// and new CRDS entries for a node briefly coexist; this method returns the expected entry
+// if present, falling back to the first entry for the IP otherwise. Returns an error only
+// if no entry exists for the IP at all.
+func (c *Client) NodeFromIPWithExpectedPubkey(ip, expectedPubkey string) (*Node, error) {
+	gossipNode, err := c.nodeFromIPWithExpectedPubkey(ip, expectedPubkey)
+	if err != nil {
+		return nil, err
+	}
+	return &Node{gossipNode: gossipNode}, nil
+}
+
+func (c *Client) nodeFromIPWithExpectedPubkey(ip, expectedPubkey string) (*rpc.GetClusterNodesResult, error) {
+	nodes, err := c.getClusterNodes()
+	if err != nil {
+		return nil, err
+	}
+
+	var firstMatch *rpc.GetClusterNodesResult
+	for _, node := range nodes {
+		if node.Gossip == nil {
+			continue
+		}
+		gossipIP := strings.Split(*node.Gossip, ":")[0]
+		if gossipIP != ip {
+			continue
+		}
+		// Found a node at this IP — prefer the one with the expected pubkey
+		if node.Pubkey.String() == expectedPubkey {
+			return node, nil
+		}
+		if firstMatch == nil {
+			firstMatch = node // stale entry — keep as fallback
+		}
+	}
+
+	if firstMatch != nil {
+		return firstMatch, nil
+	}
+	return nil, fmt.Errorf("gossip node not found for ip: %s", ip)
 }
 
 // GetCreditRankedVoteAccountFromPubkey returns the credit rank-sorted current vote accounts rank is the difference
@@ -255,9 +333,9 @@ func (c *Client) GetTimeToNextLeaderSlotForPubkey(pubkey solanago.PublicKey) (is
 		return false, time.Duration(0), nil
 	}
 
-	// Calculate time to next leader slot using slot difference and average slot time (400ms)
+	// Calculate time to next leader slot using slot difference and average slot time
 	slotDifference := nextLeaderSlot - epochInfo.AbsoluteSlot
-	timeToNextLeaderSlot = time.Duration(slotDifference) * 400 * time.Millisecond
+	timeToNextLeaderSlot = time.Duration(slotDifference) * c.averageSlotDuration
 
 	c.loggerNetwork.Debug().
 		Uint64("nextLeaderSlot", nextLeaderSlot).

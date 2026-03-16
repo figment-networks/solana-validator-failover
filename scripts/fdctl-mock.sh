@@ -19,6 +19,25 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         set-identity)
+            shift
+            # Notify mock-solana of the identity change if MOCK_SOLANA_URL and VALIDATOR_NAME are set.
+            # --force means setting to active; absence means passive.
+            if [ -n "${MOCK_SOLANA_URL:-}" ] && [ -n "${VALIDATOR_NAME:-}" ]; then
+                if echo "$@" | grep -q -- "--force"; then
+                    # Check if this set-identity-to-active call should be simulated as failing.
+                    FAIL_CHECK=$(curl -sf "${MOCK_SOLANA_URL}/fail-check?validator=${VALIDATOR_NAME}&action=set_active" 2>/dev/null || echo '{"fail":false}')
+                    if echo "$FAIL_CHECK" | grep -q '"fail":true'; then
+                        echo "fdctl-mock set-identity: SIMULATED FAILURE for ${VALIDATOR_NAME} (fail_next_set_active was set)" >&2
+                        exit 1
+                    fi
+                    ACTION="set_active"
+                else
+                    ACTION="set_passive"
+                fi
+                curl -sf -X POST -H "Content-Type: application/json" \
+                    -d "{\"action\":\"${ACTION}\",\"target\":\"${VALIDATOR_NAME}\"}" \
+                    "${MOCK_SOLANA_URL}/action" >/dev/null 2>&1 || true
+            fi
             echo "fdctl-mock set-identity: $@"
             exit 0
             ;;

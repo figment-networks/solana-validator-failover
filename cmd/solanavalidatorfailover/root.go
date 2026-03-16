@@ -56,6 +56,9 @@ func Execute() {
 }
 
 func init() {
+	// Suppress quic-go's UDP receive buffer size warning — informational only,
+	// doesn't affect functionality. See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true") //nolint:errcheck
 	cobra.OnInitialize(initLog)
 }
 
@@ -74,7 +77,16 @@ func initLog() {
 			return style.RenderGreyString(i.(string)+"=", false)
 		},
 		FormatFieldValue: func(i any) string {
-			value := fmt.Sprintf("%v", i)
+			// Zerolog passes non-string field values (bools, arrays, etc.) as raw
+			// JSON-encoded []byte. Convert to string before further formatting so
+			// that e.g. Bool("must_succeed", true) renders as "true" rather than
+			// the byte sequence [116 114 117 101].
+			var value string
+			if b, ok := i.([]byte); ok {
+				value = string(b)
+			} else {
+				value = fmt.Sprintf("%v", i)
+			}
 			isPassive := strings.HasPrefix(value, internalconstants.NodeRolePassive)
 			isActive := strings.HasPrefix(value, internalconstants.NodeRoleActive)
 			if isPassive {

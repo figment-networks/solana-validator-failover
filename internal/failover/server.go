@@ -45,6 +45,12 @@ type ServerConfig struct {
 	Hooks             hooks.FailoverHooks
 	MonitorConfig     MonitorConfig
 	SkipTowerSync     bool
+	AutoConfirm       bool
+	Rollback          hooks.RollbackConfig
+	// TLSConfig is an optional mTLS config. When non-nil, the server requires
+	// connecting clients to present a certificate signed by the configured CA.
+	// When nil, an ephemeral self-signed certificate is used (no client auth).
+	TLSConfig *tls.Config
 }
 
 // Server is the failover server - run by the passive node
@@ -52,7 +58,8 @@ type Server struct {
 	port              int
 	listenAddr        string
 	tlsConfig         *tls.Config
-	listener          quic.Listener
+	transport         *quic.Transport
+	listener          *quic.Listener
 	heartbeatInterval time.Duration
 	streamTimeout     time.Duration
 	ctx               context.Context
@@ -63,30 +70,40 @@ type Server struct {
 	rpcURL            string
 	failoverStream    *Stream
 	isDryRunFailover  bool
-	activeConn        quic.Connection
+	activeConn        *quic.Conn
 	hooks             hooks.FailoverHooks
 	monitorConfig     MonitorConfig
 	skipTowerSync     bool
+	autoConfirm       bool
+	rollback          hooks.RollbackConfig
+	mtlsEnabled       bool
 }
 
 // NewServerFromConfig creates a new failover server from a configuration
 func NewServerFromConfig(config ServerConfig) (*Server, error) {
-	// TODO: accept and parse local cert if supplied
-	tlsCert, err := utils.GenerateTLSCertificate()
-	if err != nil {
-		return nil, err
+	var serverTLSConfig *tls.Config
+	mtlsEnabled := config.TLSConfig != nil
+	if mtlsEnabled {
+		cloned := config.TLSConfig.Clone()
+		cloned.NextProtos = []string{ProtocolName}
+		serverTLSConfig = cloned
+	} else {
+		tlsCert, err := utils.GenerateTLSCertificate()
+		if err != nil {
+			return nil, err
+		}
+		serverTLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+			NextProtos:   []string{ProtocolName},
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		port: config.Port,
-		tlsConfig: &tls.Config{
-			Certificates: []tls.Certificate{tlsCert},
-			NextProtos: []string{
-				ProtocolName,
-			},
-		},
+		port:             config.Port,
+		tlsConfig:        serverTLSConfig,
+		mtlsEnabled:      mtlsEnabled,
 		logger:           log.With().Logger(),
 		ctx:              ctx,
 		cancel:           cancel,
@@ -97,6 +114,8 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		hooks:            config.Hooks,
 		monitorConfig:    config.MonitorConfig,
 		skipTowerSync:    config.SkipTowerSync,
+		autoConfirm:      config.AutoConfirm,
+		rollback:         config.Rollback,
 	}
 
 	if s.port == 0 {
@@ -112,6 +131,7 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		config.StreamTimeout = DefaultStreamTimeoutDurationStr
 	}
 
+	var err error
 	s.heartbeatInterval, err = time.ParseDuration(config.HeartbeatInterval)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse heartbeat interval: %v", err)
@@ -127,8 +147,13 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 
 // Start starts the failover server
 func (s *Server) Start() error {
-	listener, err := quic.ListenAddr(
-		fmt.Sprintf(":%d", s.port),
+	wrapped, err := newBasicPacketConn(fmt.Sprintf(":%d", s.port))
+	if err != nil {
+		return fmt.Errorf("failed to create UDP socket: %v", err)
+	}
+	s.transport = &quic.Transport{Conn: wrapped}
+
+	listener, err := s.transport.Listen(
 		s.tlsConfig,
 		&quic.Config{
 			KeepAlivePeriod: s.heartbeatInterval,
@@ -136,9 +161,10 @@ func (s *Server) Start() error {
 		},
 	)
 	if err != nil {
+		wrapped.Close()
 		return fmt.Errorf("failed to create listener: %v", err)
 	}
-	s.listener = *listener
+	s.listener = listener
 
 	s.logger.Info().Msgf("Listening on port %d - run this program on the ACTIVE validator to continue", s.port)
 
@@ -162,10 +188,24 @@ func (s *Server) Start() error {
 }
 
 // handleConnection handles a new failover connection
-func (s *Server) handleConnection(conn quic.Connection) {
+func (s *Server) handleConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "connection closed")
 
 	s.logger.Debug().Str("remote_addr", conn.RemoteAddr().String()).Msg("Accepted new connection")
+
+	if s.mtlsEnabled {
+		tlsState := conn.ConnectionState().TLS
+		if len(tlsState.PeerCertificates) > 0 {
+			peer := tlsState.PeerCertificates[0]
+			s.logger.Info().
+				Str("remote_addr", conn.RemoteAddr().String()).
+				Str("subject", peer.Subject.String()).
+				Str("issuer", peer.Issuer.String()).
+				Time("expires", peer.NotAfter).
+				Msg("mTLS: client certificate verified")
+		}
+	}
+
 	s.activeConn = conn
 
 	// Accept streams
@@ -182,7 +222,7 @@ func (s *Server) handleConnection(conn quic.Connection) {
 }
 
 // handleStream handles a new failover stream
-func (s *Server) handleStream(stream quic.Stream) {
+func (s *Server) handleStream(stream *quic.Stream) {
 	defer stream.Close()
 
 	// Read the message type
@@ -196,6 +236,14 @@ func (s *Server) handleStream(stream quic.Stream) {
 		return
 	}
 
+	// Check wire protocol version before any gob work.
+	// This gives a clear error when nodes are running incompatible versions,
+	// rather than the cryptic gob type-mismatch that would otherwise surface.
+	if err := readAndCheckWireVersion(stream); err != nil {
+		s.logger.Fatal().Err(err).Msg("aborting: " + err.Error())
+		return
+	}
+
 	switch msgType[0] {
 	case MessageTypeFailoverInitiateRequest: // failover
 		s.logger.Debug().Msgf("Received failover initiate request")
@@ -205,10 +253,17 @@ func (s *Server) handleStream(stream quic.Stream) {
 	}
 }
 
-func (s *Server) handleFailoverStream(stream quic.Stream) {
+func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	// read the message and parse it into a Stream struct
 	s.failoverStream = NewFailoverStream(stream)
 	if s.failoverStream.Decode() != nil {
+		return
+	}
+
+	// Write our wire protocol version in the server→client direction before
+	// any gob encode so the client can verify compatibility symmetrically.
+	if err := writeWireVersion(stream); err != nil {
+		s.logger.Error().Err(err).Msg("failed to write wire version to client")
 		return
 	}
 
@@ -268,7 +323,29 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 	activeRPCURL := s.failoverStream.GetActiveNodeInfo().RPCAddress
 	passiveRPCURL := s.failoverStream.GetPassiveNodeInfo().RPCAddress
 
-	if err := s.failoverStream.ConfirmFailover(s.hooks, activeRPCURL, passiveRPCURL); err != nil {
+	// Abort if rollback is enabled on one side but not the other.
+	// Partial rollback is worse than no rollback — one node reverts while the other stays passive.
+	clientRollback := s.failoverStream.GetActiveRollbackEnabled()
+	serverRollback := s.rollback.Enabled
+	if serverRollback != clientRollback {
+		var msg string
+		if serverRollback {
+			msg = "rollback mismatch: this node has rollback.enabled=true but the active node does not"
+		} else {
+			msg = "rollback mismatch: the active node has rollback.enabled=true but this node does not"
+		}
+		msg += " — both nodes must have rollback identically configured; fix the config and retry"
+		s.failoverStream.SetErrorMessage(msg)
+		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
+			s.logger.Error().Err(encodeErr).Msg("failed to send error message to client")
+		}
+		s.logger.Fatal().Msg(msg)
+		return
+	}
+
+	s.logger.Info().Msgf("%s connected from %s - failover plan:", s.failoverStream.GetActiveNodeInfo().Hostname, s.activeConn.RemoteAddr())
+
+	if err := s.failoverStream.ConfirmFailover(s.hooks, s.rollback, activeRPCURL, passiveRPCURL, s.autoConfirm); err != nil {
 		s.logger.Error().Err(err).Msg("failover cancelled")
 
 		// Send error message to client before exiting
@@ -278,9 +355,14 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 		}
 
 		// close the server listener and cancel the context to stop accepting new connections
-		if s.listener != (quic.Listener{}) {
+		if s.listener != nil {
 			if err := s.listener.Close(); err != nil {
 				s.logger.Error().Err(err).Msg("failed to close listener")
+			}
+		}
+		if s.transport != nil {
+			if err := s.transport.Close(); err != nil {
+				s.logger.Error().Err(err).Msg("failed to close transport")
 			}
 		}
 		s.cancel()
@@ -355,9 +437,9 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 	}
 
 	if s.skipTowerSync {
-		s.logger.Info().Msgf("🟤 Failover started - skipping tower file sync")
+		s.logger.Info().Msg("Failover started - skipping tower file sync")
 	} else {
-		s.logger.Info().Msgf("🟤 Failover started - waiting for tower file from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
+		s.logger.Info().Msgf("Failover started - waiting for tower file from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
 
 		// Wait for the updated node info with tower file bytes
 		if err := s.failoverStream.Decode(); err != nil {
@@ -383,7 +465,7 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 			)
 			s.logger.Error().Msg("then run:")
 			fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
-			s.logger.Fatal().Msg("something has turned to 💩")
+			s.logger.Fatal().Msg("tower file hash mismatch - failover aborted")
 			return
 		}
 
@@ -400,7 +482,7 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 		}
 
 		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
-		s.logger.Info().Msg("👉 Received tower file")
+		s.logger.Info().Msg("Received tower file")
 	}
 
 	// set identity to active
@@ -410,7 +492,7 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 	}
 	s.logger.Info().
 		Str("command", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand).
-		Msgf("👉%sSetting identity to %s - %s",
+		Msgf("%sSetting identity to %s - %s",
 			dryRunPrefix,
 			style.RenderActiveString(strings.ToUpper(constants.NodeRoleActive), false),
 			style.RenderActiveString(s.failoverStream.GetPassiveNodeInfo().Identities.Active.PubKey(), false),
@@ -424,7 +506,27 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 		LogDebug:     s.logger.Debug().Enabled(),
 	})
 	if err != nil {
-		s.logger.Fatal().Err(err).Msgf("failed to set identity to active with command: %s", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
+		s.logger.Error().Err(err).Msgf("failed to set identity to active with command: %s", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
+		if s.rollback.Enabled {
+			// Both sides have rollback enabled (mismatch is caught earlier).
+			s.logger.Warn().Msg("rollback enabled: signalling active node to revert, then re-asserting passive identity")
+			s.failoverStream.SetRollbackRequired(true)
+			// best-effort — client may already be gone; ignore encode error
+			_ = s.failoverStream.Encode()
+			if rbErr := RunRollbackToPassive(s.rollback, s.getHookEnvMap(hookEnvMapParams{
+				isDryRunFailover: s.isDryRunFailover,
+				isPostFailover:   true,
+			}), s.isDryRunFailover, s.logger); rbErr != nil {
+				s.logger.Error().Err(rbErr).Msg("rollback to passive FAILED — manual intervention required")
+			}
+		} else {
+			s.logger.Error().Msg("rollback disabled — this node is still passive; the peer has also switched to passive")
+			if s.rollback.ToPassive.ResolvedCmd != "" {
+				s.logger.Error().Msgf("to recover this node: %s", s.rollback.ToPassive.ResolvedCmd)
+			}
+		}
+		s.logger.Fatal().Err(err).Msgf("set identity to active failed — failover aborted")
+		return
 	}
 
 	s.failoverStream.SetPassiveNodeSetIdentityEndTime()
@@ -446,38 +548,46 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 		return
 	}
 
-	// failover is complete, timings will be reported in the main failover stream
-	s.logger.Info().Msg("🟢 Failover complete:")
-	fmt.Println(s.failoverStream.GetStateTable())
-
 	// run post hooks when active
 	s.hooks.RunPostWhenActive(s.getHookEnvMap(hookEnvMapParams{
 		isDryRunFailover: s.isDryRunFailover,
 		isPostFailover:   true,
 	}))
 
-	s.logger.Info().Msg("🕐 Failover timing summary:")
-	fmt.Println(s.failoverStream.GetFailoverDurationTableString())
-
 	if !s.isDryRunFailover {
 		s.confirmGossipNodesPostFailover()
 	}
 
+	// build and render the post-failover summary immediately (before credit monitoring)
+	summaryData := s.failoverStream.BuildSummaryData()
+	rendered, renderErr := RenderFailoverSummary(summaryData)
+	if renderErr != nil {
+		s.logger.Error().Err(renderErr).Msg("failed to render failover summary")
+	} else {
+		s.logger.Info().Msg("Post-failover state:")
+		fmt.Println(style.RenderMessageString(strings.Trim(rendered, "\n")))
+	}
+
 	// monitor the credits by pulling configured samples
-	s.logger.Info().Msg("🩺 Monitoring vote credits post-failover...")
+	s.logger.Info().Msg("Monitoring vote credits post-failover...")
 	err = s.failoverStream.PullActiveIdentityVoteCreditsSamples(s.solanaRPCClient, s.monitorConfig.CreditSamples.Count, s.monitorConfig.CreditSamples.IntervalDuration)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to pull active identity vote credits samples")
-		return
 	}
 
-	// report the credit samples difference
-	rankDifference, firstRank, lastRank, err := s.failoverStream.GetVoteCreditRankDifference()
-	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to get vote credit rank difference")
-		return
+	rankDifference, firstRank, lastRank, rankErr := s.failoverStream.GetVoteCreditRankDifference()
+	if rankErr == nil {
+		var rankMsg string
+		switch {
+		case rankDifference > 0:
+			rankMsg = style.RenderActiveString(fmt.Sprintf("improved by +%d", rankDifference), false)
+		case rankDifference < 0:
+			rankMsg = style.RenderPassiveString(fmt.Sprintf("worsened by %d", rankDifference), false)
+		default:
+			rankMsg = style.RenderLightGreyString("unchanged")
+		}
+		s.logger.Info().Msgf("Vote credits: rank %s (%d → %d)", rankMsg, firstRank, lastRank)
 	}
-	s.logger.Info().Msgf("🏁 Vote credit rank change: %d (%d -> %d)", rankDifference, firstRank, lastRank)
 
 	// close the stream and connection cleanly
 	if err := stream.Close(); err != nil {
@@ -488,9 +598,14 @@ func (s *Server) handleFailoverStream(stream quic.Stream) {
 	}
 
 	// close the server listener and cancel the context to stop accepting new connections
-	if s.listener != (quic.Listener{}) {
+	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
 			s.logger.Error().Err(err).Msg("failed to close listener")
+		}
+	}
+	if s.transport != nil {
+		if err := s.transport.Close(); err != nil {
+			s.logger.Error().Err(err).Msg("failed to close transport")
 		}
 	}
 	s.cancel()
@@ -516,8 +631,12 @@ func (s *Server) confirmGossipNodesPostFailover() {
 			retryCount++
 			hasRetriesLeft := retryCount < maxRetries
 
-			// active node is now the old passive node
-			solanaActiveNode, err = s.solanaRPCClient.NodeFromIP(s.failoverStream.GetPassiveNodeInfo().PublicIP)
+			// active node is now the old passive node — prefer the expected pubkey to handle
+			// dual CRDS entries that briefly coexist during a gossip identity transition
+			solanaActiveNode, err = s.solanaRPCClient.NodeFromIPWithExpectedPubkey(
+				s.failoverStream.GetPassiveNodeInfo().PublicIP,
+				s.failoverStream.GetPassiveNodeInfo().Identities.Active.PubKey(),
+			)
 			if err != nil && hasRetriesLeft {
 				sp.Title(style.RenderWarningStringf("(attempt %d of %d) failed to refresh active node info from gossip - retrying", retryCount, maxRetries))
 				time.Sleep(retryDelay)
@@ -529,8 +648,11 @@ func (s *Server) confirmGossipNodesPostFailover() {
 				return fmt.Errorf("(attempt %d of %d) failed to refresh active node info from gossip - giving up", retryCount, maxRetries)
 			}
 
-			// passive node is now the old active node
-			solanaPassiveNode, err = s.solanaRPCClient.NodeFromIP(s.failoverStream.GetActiveNodeInfo().PublicIP)
+			// passive node is now the old active node — prefer the expected pubkey for the same reason
+			solanaPassiveNode, err = s.solanaRPCClient.NodeFromIPWithExpectedPubkey(
+				s.failoverStream.GetActiveNodeInfo().PublicIP,
+				s.failoverStream.GetActiveNodeInfo().Identities.Passive.PubKey(),
+			)
 			if err != nil && hasRetriesLeft {
 				sp.Title(style.RenderWarningStringf("(attempt %d of %d) failed to refresh fetch passive node info - retrying", retryCount, maxRetries))
 				time.Sleep(retryDelay)

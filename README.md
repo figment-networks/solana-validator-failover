@@ -2,56 +2,119 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simple p2p Solana validator failovers. This tool helps automate *planned* failvoers. To automate *unexpected* failovers, see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
+Simple p2p Solana validator failovers. This tool helps automate _planned_ failovers. To automate _unexpected_ failovers, see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
 
-![solanna-validator-failover-passive-to-active-png](vhs/failover-passive-to-active.png)
+![solana-validator-failover](docs/failover.png)
 
-A simple QUIC-based program to failover between Solana validators safely and quickly. [This post](https://blog.solstrategies.io/quic-solana-validator-failovers-738d712ac737) explains some background in more detail. In summary this program orchestrates the three-step process of failing over from an active (voting) to a passive (non-voting) validator:
+A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://blog.solstrategies.io/quic-solana-validator-failovers-738d712ac737) covers the background in more detail. In summary, it coordinates three steps across both nodes:
 
-1. active validator sets identity to passive
-2. tower file synced from active to passive validator
-3. passive validator sets identity to active
-
-Start a failover server on the passive node:
-
-![solanna-validator-failover-passive-to-active](vhs/failover-passive-to-active.gif)
-
-Start a failover client on the active node to hand over to the passive node:
-
-![solanna-validator-failover-active-to-passive](vhs/failover-active-to-passive.gif)
+1. Active validator sets identity to passive
+2. Tower file synced from active to passive validator
+3. Passive validator sets identity to active
 
 Convenience safety checks, bells, and whistles:
 
 - Check and wait for validator health before failing over
 - Wait for the estimated best slot time to failover
-- Wait for no leader slots in the near future (if things go sideways - make it hurt a little less by not being leader 😬)
+- Wait for no leader slots in the near future (if things go sideways — make it hurt a little less by not being leader 😬)
 - Post-failover vote credit rank monitoring
 - Pre/post failover hooks
 - Customizable validator client and set identity commands to support (most) any validator client
 
+## How it works
+
+Running `solana-validator-failover run` on either node **automatically detects the node's role** (active or passive) from gossip and does the right thing:
+
+- **Passive node** → starts a QUIC server, waits for the active node to connect
+- **Active node** → connects to the passive peer as a QUIC client and orchestrates the handover
+
+**You run the command on both nodes.** Start the passive node first so it is listening when the active node connects.
+
+![solana-validator-failover passive-to-active](docs/failover-passive-to-active.gif)
+
+![solana-validator-failover active-to-passive](docs/failover-active-to-passive.gif)
+
 ## Usage
 
 ```shell
-# on any node declared in solana-validator-failover.yaml
-# run the failover - a passive node will send a request to the active one to take over
-# By default it runs in dry-run mode, to run for real, run on the passive node with `--not-a-drill`
+# 1. Run on the passive node first — starts a server waiting for the active node
+solana-validator-failover run --not-a-drill
+
+# 2. Run on the active node — connects to the passive peer and initiates the handover
 solana-validator-failover run
 ```
 
-By default, `run` runs in dry-run mode where only the tower file is synced between nodes and set identity commands are mocked. This is to safeguard against fat fingers (we've all been there) and also to give an idea of the expected total failover time under current network conditions. When ready, re-run on the passive node with `--not-a-drill` to do it for realsies.
+By default, `run` executes in **dry-run mode**: the tower file is synced and all timings are recorded, but set-identity commands are not executed. This is useful for gauging failover speed under real network conditions without committing. Pass `--not-a-drill` on the **passive** node to execute for real.
 
-⚠️ WARNING: _who_ you run this program as matters - the user:
-- requires permissions to run set identity commands for the validator
-- requires permissions to read/write the tower file - check inherited tower file permissions are what you expect after a dry-run
+> ⚠️ **Who you run this as matters.** The user must have:
+> - Permission to run set-identity commands for the validator
+> - Read/write permission on the tower file — verify inherited permissions after a dry-run
+
+### Flags
+
+#### `run` flags
+
+| Flag                           | Default | Description                                                                                                                                                       |
+| ------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--not-a-drill`                | `false` | Execute failover for real. Effective on the passive node; ignored on the active node.                                                                             |
+| `--no-wait-for-healthy`        | `false` | Skip waiting for the node to report healthy at `<rpc_address>/health`.                                                                                            |
+| `--no-min-time-to-leader-slot` | `false` | Skip waiting for the active node to have no leader slots in the next `min_time_to_leader_slot` window. Effective on the active node; ignored on the passive node. |
+| `--skip-tower-sync`            | `false` | Skip syncing the tower file from active to passive. The passive node must not have an existing tower file.                                                        |
+| `-y, --yes`                    | `false` | Skip all interactive confirmation prompts.                                                                                                                        |
+| `--to-peer <name\|ip>`         | —       | When run on the active node, auto-select a peer by its configured name or IP address, skipping the interactive selector. Ignored on the passive node.             |
+
+#### Persistent flags
+
+| Flag                      | Default                                                      | Description                                   |
+| ------------------------- | ------------------------------------------------------------ | --------------------------------------------- |
+| `-c, --config <path>`     | `~/solana-validator-failover/solana-validator-failover.yaml` | Path to config file.                          |
+| `-l, --log-level <level>` | `info`                                                       | Log level (`debug`, `info`, `warn`, `error`). |
+
+### Peer selection
+
+The active node **always prompts you to select a peer**, even when only one is configured. Use `--to-peer <name|ip>` to skip the prompt — useful for scripted or non-interactive failovers:
+
+```shell
+# Skip peer selection prompt by name
+solana-validator-failover run --to-peer backup-validator-region-x
+
+# Fully non-interactive (skip peer selection and all confirmation prompts)
+solana-validator-failover run --to-peer backup-validator-region-x --yes
+```
 
 ## Installation
 
-Build from source or download the built package for your system from the [releases](https://github.com/SOL-Strategies/solana-validator-failover/releases) page. If your arch isn't listed, ping us.
+### Download binary
+
+Download and install the latest [release](https://github.com/SOL-Strategies/solana-validator-failover/releases) binary for your system.
+
+### From source
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/sol-strategies/solana-validator-failover.git
+   cd solana-validator-failover
+   ```
+
+2. **Build the application:**
+   ```bash
+   make build
+   # or manually:
+   go build -o bin/solana-validator-failover ./cmd/solanavalidatorfailover
+   ```
+
+3. **Copy the binary to where you need it:**
+   ```bash
+   cp ./bin/solana-validator-failover /usr/local/bin/solana-validator-failover
+   ```
 
 ## Prerequisites
 
-1. A (_preferrably private_ and low-latency) UDP route between active and passive validators. Latency can vary lots across setups, so YMMV, though QUIC should give a good head start.
-2. Some focus and appreciation of what you're doing - these can be high pucker factor operations regardless of tooling.
+1. **A (preferably private) low-latency UDP route** between active and passive validators. Latency varies across setups, so YMMV, though QUIC should give a good head start.
+
+2. **Some focus and appreciation of what you're doing** — these can be high pucker factor operations regardless of tooling.
+
+3. **Local validator started with `--full-rpc-api`** — this tool calls `getClusterNodes` on the local RPC, which requires the validator to be started with the `--full-rpc-api` flag (Agave/Firedancer).
 
 ## Configuration
 
@@ -63,21 +126,44 @@ validator:
   bin: agave-validator
 
   # (required) cluster this validator runs on
-  #            one of: mainnet-beta, testnet, devnet, localnet
+  #            well-known clusters: mainnet-beta, testnet, devnet, localnet
+  #            any other value is treated as a custom cluster (requires cluster_rpc_url)
   cluster: mainnet-beta
+
+  # (required for custom clusters) RPC URL for the cluster - must support getClusterNodes.
+  # For well-known clusters the built-in URL is used. For custom clusters, or if you need
+  # to override the default (e.g. to use a private RPC), set this explicitly.
+  # cluster_rpc_url: <solana_compatible_rpc_endpoint>
+
+  # optional display name used in failover plans, logs, and hook templates
+  # defaults to OS hostname if not set
+  # name: london
+
+  # average slot duration, used to estimate time to next leader slot
+  # default: 400ms
+  # average_slot_duration: 400ms
 
   # this validator's identities
   identities:
-    # (required) path to identity file to use when ACTIVE
+    # (required or active_pubkey) path to identity file to use when ACTIVE
+    # when supplied with active_pubkey, active takes precedence
     active: /home/solana/active-validator-identity.json
+    # (required or active) base58 encoded pubkey to use when ACTIVE
+    # when supplied with active, active takes precedence
+    active_pubkey: 111111ActivePubkey1111111111111111111111111
     # (required) path to identity file to use when PASSIVE
+    # when supplied with passive_pubkey, passive takes precedence
     passive: /home/solana/passive-validator-identity.json
+    # (required or passive) base58 encoded pubkey to use when PASSIVE
+    # when supplied with passive, passive takes precedence
+    passive_pubkey: 111111PassivePubkey1111111111111111111111111
 
   # (required) ledger directory made available to set-identity command templates
   ledger_dir: /mnt/ledger
 
   # local rpc address of node this program runs on
   # default: http://localhost:8899
+  # note: the validator must be started with --full-rpc-api (required for getClusterNodes)
   rpc_address: http://localhost:8899
 
   # tower file config
@@ -85,7 +171,7 @@ validator:
     # (required) directory hosting the tower file
     dir: /mnt/accounts/tower
 
-    # when passive, delete the towerfile if one exists before starting a failover server
+    # when passive, delete the tower file if one exists before starting a failover server
     # default: false
     auto_empty_when_passive: false
 
@@ -96,11 +182,40 @@ validator:
 
   # failover configuration
   failover:
-
     # failover server config (runs on passive node taking over from active node)
     server:
       # default: 9898 - QUIC (udp) port to listen on
       port: 9898
+
+    # (optional) mutual TLS for the QUIC connection between validators.
+    # When disabled (the default), the connection uses an ephemeral self-signed
+    # certificate — encrypted but unauthenticated.
+    # When enabled, both nodes must present a certificate signed by the shared CA.
+    #
+    # Certificate requirements:
+    # - ca_cert: the same CA certificate must be present on both nodes
+    # - cert/key: each node's certificate must include a SAN matching the address
+    #   used in failover.peers — an IP SAN if the address is an IP, a DNS SAN if a hostname
+    #
+    # Generating certs (example using openssl):
+    #   # CA
+    #   openssl ecparam -name prime256v1 -genkey -noout -out ca.key
+    #   openssl req -new -x509 -key ca.key -out ca.crt -days 3650 -subj "/CN=failover-ca"
+    #
+    #   # Node cert with IP SAN (use DNS:hostname instead if peers use FQDNs)
+    #   openssl ecparam -name prime256v1 -genkey -noout -out node.key
+    #   openssl req -new -key node.key -out node.csr -subj "/CN=validator-node"
+    #   openssl x509 -req -in node.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    #     -out node.crt -days 3650 -extfile <(printf "subjectAltName=IP:192.0.2.1")
+    tls:
+      # default: false
+      enabled: false
+      # path to the shared CA certificate (must be identical on both nodes)
+      ca_cert: /etc/solana-failover/tls/ca.crt
+      # path to this node's certificate (signed by ca_cert)
+      cert: /etc/solana-failover/tls/node.crt
+      # path to this node's private key
+      key: /etc/solana-failover/tls/node.key
 
     # golang template strings for command to set identity to active/passive
     # use this to set the appropriate command/args for your validator as required
@@ -110,18 +225,19 @@ validator:
     #                     the loaded identities from validator.identities
     # {{ .LedgerDir }}  - a resolved absolute path to validator.ledger_dir
     # defaults shown below
-    set_identity_active_cmd_template:  "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Active.KeyFile }} --require-tower"
+    set_identity_active_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Active.KeyFile }} --require-tower"
     set_identity_passive_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Passive.KeyFile }}"
 
-    # failover peers - keys are vanity hostnames to help you review program output better
+    # failover peers - keys are vanity names shown in program output and usable with --to-peer
+    # configure one peer per passive validator you may want to fail over to
     peers:
       backup-validator-region-x:
         # host and port to connect to failover server
         address: backup-validator-region-x.some-private.zone:9898
 
     # duration string representing the minimum amount of time before the active node is due to
-    # be the leader, if the failover is initiated below this threshold it will wait until this
-    # window has passed to begin failing over
+    # be the leader; if the failover is initiated below this threshold it will wait until this
+    # window has passed before connecting to the passive peer
     # default: 5m
     min_time_to_leader_slot: 5m
 
@@ -204,7 +320,7 @@ validator:
             environment: # optional map of custom environment variables (values support template interpolation)
               MY_VAR: "{{ .ThisNodeName }}"
               PEER_IP: "{{ .PeerNodePublicIP }}"
-      # hooks to run after failover - errors in post hooks displayed but do nothing
+      # hooks to run after failover - errors in post hooks are displayed but do not affect the failover result
       post:
         # run after failover when validator is active
         when_active:
@@ -222,7 +338,81 @@ validator:
             environment: # optional map of custom environment variables (values support template interpolation)
               MY_VAR: "{{ .ThisNodeName }}"
               PEER_IP: "{{ .PeerNodePublicIP }}"
+    # (optional) Automatic rollback configuration.
+    # When enabled, if a failover fails after the active node has already switched to passive,
+    # the passive node signals the active node to revert. Both nodes attempt to return to their
+    # original roles.
+    #
+    # IMPORTANT LIMITATIONS — read before enabling:
+    # - Rollback is only triggered by an explicit signal from the passive node. If the network
+    #   connection drops after the passive node successfully sets its identity to active, no
+    #   automatic rollback occurs (to prevent the risk of two active validators). The operator
+    #   must check gossip and intervene manually.
+    # - If the rollback itself fails, the cluster may still be left without an active leader.
+    #   Rollback failures are logged at ERROR level with manual recovery commands.
+    # - Both nodes must have rollback enabled and configured identically for coordination to work.
+    # - Rollback hooks are always run (pre then post), even if the set-identity command fails.
+    rollback:
+      # default: false — opt-in
+      enabled: false
+
+      # Configuration for reverting the active node (which switched to passive) back to active.
+      # Triggered when the passive node signals that it failed to become active.
+      to_active:
+        # Go template for the rollback set-identity command.
+        # Supports the same template fields as set_identity_active_cmd_template.
+        # When empty, defaults to set_identity_active_cmd_template.
+        cmd_template: ""
+        hooks:
+          # run after the rollback set-identity command (always runs, even if cmd failed)
+          post:
+            - name: notify-rollback-to-active
+              command: ./scripts/notify_rollback.sh
+              args: ["to-active"]
+
+      # Configuration for re-asserting the passive node's passive identity when it failed to
+      # become active. Triggered on the passive node when set-identity-to-active fails.
+      to_passive:
+        # Go template for the rollback set-identity command.
+        # Supports the same template fields as set_identity_passive_cmd_template.
+        # When empty, defaults to set_identity_passive_cmd_template.
+        cmd_template: ""
+        hooks:
+          # run after the rollback set-identity command (always runs, even if cmd failed)
+          post:
+            - name: notify-rollback-to-passive
+              command: ./scripts/notify_rollback.sh
+              args: ["to-passive"]
 ```
+
+## Rollback
+
+`failover.rollback` is an opt-in feature that attempts to automatically revert both nodes to their original roles if a failover fails after identities have started changing.
+
+### When it triggers
+
+Rollback is only triggered by an **explicit signal** from the passive node. Specifically: after the active node has switched to passive and sent the tower file, if the passive node's `set-identity-to-active` command fails, it signals the active node to revert before exiting.
+
+### What it does
+
+| Node                                             | Rollback action                                                                   |
+| ------------------------------------------------ | --------------------------------------------------------------------------------- |
+| Active node (was active, became passive)         | Runs `set-identity-to-active` command → `rollback.to_active` post-hooks           |
+| Passive node (tried and failed to become active) | Runs `set-identity-to-passive` command → `rollback.to_passive` post-hooks         |
+
+Post-hooks always run even if the set-identity command fails. Pre hooks are intentionally not supported for rollback: a pre hook with `must_succeed: true` could block the rollback set-identity command from running, which would defeat the purpose of rollback.
+
+### Limitations
+
+**No auto-rollback on connection drop.** If the network connection drops after the passive node *successfully* set its identity to active (but before the client received confirmation), the active node does **not** automatically rollback. Auto-rollback in this scenario would risk creating two active validators. Instead, a `CRITICAL` log is emitted with the manual recovery command, and the operator must check gossip to determine the actual cluster state.
+
+**Rollback can itself fail.** If the rollback set-identity command fails, both nodes may still be passive. Rollback failures are logged at `ERROR` level with the manual recovery command. There is no retry — operators must intervene.
+
+**Both nodes must be configured identically.** Rollback config is local to each node's config file. Both nodes must have `rollback.enabled: true` and the correct commands configured.
+
+### Rollback is shown in the failover plan
+
+When `rollback.enabled: true`, the pre-failover plan shows the rollback commands that would run on each node if the failover fails, giving operators visibility before they confirm.
 
 ## Developing
 
@@ -240,9 +430,3 @@ make build
 # or build from docker
 make build-compose
 ```
-
-## Laundry/wish list:
-
-- [ ] TLS config
-- [ ] Refactor to make e2e testing easier - current setup not optimal
-- [ ] Rollbacks (to the extent it's possible)

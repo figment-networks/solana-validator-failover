@@ -54,6 +54,36 @@ func (h FailoverHooks) HasPreHooksWhenPassive() bool {
 	return len(h.Pre.WhenPassive) > 0
 }
 
+// RollbackHooksConfig holds hooks to run after a rollback set-identity command.
+// Pre hooks are intentionally omitted: a pre hook with must_succeed could block the
+// rollback set-identity command from running, defeating the purpose of rollback.
+type RollbackHooksConfig struct {
+	Post Hooks `mapstructure:"post"`
+}
+
+// RollbackDirectionConfig configures one rollback direction (to_active or to_passive).
+type RollbackDirectionConfig struct {
+	// CmdTemplate is a Go template string for the set-identity rollback command.
+	// When empty, it defaults to the corresponding normal set-identity command
+	// (resolved during validator startup and stored in ResolvedCmd).
+	CmdTemplate string              `mapstructure:"cmd_template"`
+	Hooks       RollbackHooksConfig `mapstructure:"hooks"`
+	// ResolvedCmd is populated during validator configuration (not read from YAML).
+	// It holds the fully-expanded command string that will be run on rollback.
+	ResolvedCmd string `mapstructure:"-"`
+}
+
+// RollbackConfig is the full rollback configuration under failover.rollback.
+type RollbackConfig struct {
+	// Enabled controls whether automatic rollback runs when a failover fails mid-way.
+	// Default: false.
+	Enabled bool `mapstructure:"enabled"`
+	// ToActive is used by the active node (which switched to passive) to revert to active.
+	ToActive RollbackDirectionConfig `mapstructure:"to_active"`
+	// ToPassive is used by the passive node (which failed to become active) to re-assert passive.
+	ToPassive RollbackDirectionConfig `mapstructure:"to_passive"`
+}
+
 // HookTemplateData is the data structure available for hook templates
 type HookTemplateData struct {
 	// Failover state
@@ -235,10 +265,10 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 	}
 
 	// Start the command
-	hookLogger.Info().
+	hookLogger.Debug().
 		Str("command", command).
 		Str("args", fmt.Sprintf("[%s]", strings.Join(args, ", "))).
-		Msgf("🪝  Running hook %s", h.Name)
+		Msgf("Running hook %s", h.Name)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("Hook %s failed to start: %v", h.Name, err)
 	}
@@ -283,10 +313,10 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 	wg.Wait()
 
 	if err != nil {
-		return fmt.Errorf("🪝 🔴 Hook %s failed: %v", h.Name, err)
+		return fmt.Errorf("Hook %s failed: %v", h.Name, err)
 	}
 
-	hookLogger.Info().Msgf("🪝  Hook %s completed successfully", h.Name)
+	hookLogger.Debug().Msgf("Hook %s completed successfully", h.Name)
 	return nil
 }
 
@@ -300,8 +330,8 @@ var (
 
 // styledStreamOutputString creates styled output for stream content with the requested format
 func styledStreamOutputString(stream string, text string, hookName string, hookType string, hookIndex int, totalHooks int) string {
-	// Format: 🪝 hooks:<pre|post>:[1/1 <hook-name>]: ▶ <script output>
-	prefix := fmt.Sprintf("🪝  hooks:%s:[%d/%d %s]:", hookType, hookIndex, totalHooks, hookName)
+	// Format: hooks:<pre|post>:[1/1 <hook-name>]: ▶ <script output>
+	prefix := fmt.Sprintf("hooks:%s:[%d/%d %s]:", hookType, hookIndex, totalHooks, hookName)
 	styledPrefix := PrefixStyle.Render(prefix)
 
 	// Apply color to the script output based on stream type
