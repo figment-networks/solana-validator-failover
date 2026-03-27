@@ -678,6 +678,7 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		IsDryRunFailover: !params.NotADrill,
 		Hooks:            v.Hooks,
 		SkipTowerSync:    params.SkipTowerSync,
+		SkipVoteCreditsCheck: params.SkipVoteCreditsCheck,
 		AutoConfirm:      params.AutoConfirm,
 		MonitorConfig: failover.MonitorConfig{
 			CreditSamples: failover.CreditSamplesConfig{
