@@ -33,6 +33,7 @@ type FailoverParams struct {
 	MinTimeToLeaderSlot   time.Duration
 	SkipTowerSync         bool
 	SkipTowerFileCheck    bool
+	SkipVoteCreditsCheck  bool
 	AutoConfirm           bool   // -y/--yes: skip all interactive confirmations
 	ToPeer                string // --to-peer: auto-select peer by name or IP (active node only)
 	RollbackEnabled       bool   // --rollback-enabled/-r: force-enable rollback regardless of config
@@ -796,8 +797,9 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		IsDryRunFailover: !params.NotADrill,
 		Hooks:            v.Hooks,
 		Rollback:         v.Rollback,
-		SkipTowerSync:    params.SkipTowerSync,
-		AutoConfirm:      params.AutoConfirm,
+		SkipTowerSync:        params.SkipTowerSync,
+		SkipVoteCreditsCheck: params.SkipVoteCreditsCheck,
+		AutoConfirm:          params.AutoConfirm,
 		TLSConfig:        v.serverTLSConfig,
 		MonitorConfig: failover.MonitorConfig{
 			CreditSamples: failover.CreditSamplesConfig{
