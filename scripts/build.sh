@@ -42,12 +42,19 @@ go_test() {
 go_build() {
     osarchList="$(echo "${BUILD_OS_ARCH_LIST}" | sed 's/,/ /g')"
     log_info "building ${osarchList}"
+    BUILD_TAGS=""
+    case "${APP_VERSION}" in
+        *testnet*) BUILD_TAGS="-tags testnet" ;;
+    esac
+    if [ -n "${BUILD_TAGS}" ]; then
+        log_info "build tags: ${BUILD_TAGS}"
+    fi
     for osarch in ${osarchList}; do
         os=$(echo "${osarch}" | cut -d '-' -f1)
         arch=$(echo "${osarch}" | cut -d '-' -f2)
         binOutput="${BUILD_DIR}/${APP_NAME}-${APP_VERSION}-${os}-${arch}"
         log_info "building ${binOutput}"
-        GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o "${binOutput}" || exit 1
+        GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath ${BUILD_TAGS} -o "${binOutput}" || exit 1
         log_info "building ${binOutput} - complete"
         if [ "${CI}" = "true" ]; then
             # create gzipped binary (GitHub shows sha256 for each asset automatically)
