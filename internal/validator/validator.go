@@ -32,6 +32,7 @@ type FailoverParams struct {
 	NoMinTimeToLeaderSlot bool
 	MinTimeToLeaderSlot   time.Duration
 	SkipTowerSync         bool
+	SkipTowerFileCheck    bool
 	AutoConfirm           bool   // -y/--yes: skip all interactive confirmations
 	ToPeer                string // --to-peer: auto-select peer by name or IP (active node only)
 	RollbackEnabled       bool   // --rollback-enabled/-r: force-enable rollback regardless of config
@@ -829,12 +830,13 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 	log.Debug().Msg("failover active to passive")
 
 	// ensure tower file exists and is not empty
-	if !utils.FileExists(v.TowerFile) {
-		return fmt.Errorf("tower file does not exist: %s", v.TowerFile)
-	}
-
-	if utils.FileSize(v.TowerFile) == 0 {
-		return fmt.Errorf("tower file is empty: %s", v.TowerFile)
+	if !params.SkipTowerFileCheck {
+		if !utils.FileExists(v.TowerFile) {
+			return fmt.Errorf("tower file does not exist: %s", v.TowerFile)
+		}
+		if utils.FileSize(v.TowerFile) == 0 {
+			return fmt.Errorf("tower file is empty: %s", v.TowerFile)
+		}
 	}
 
 	// select passive peer to connect to from declared peers

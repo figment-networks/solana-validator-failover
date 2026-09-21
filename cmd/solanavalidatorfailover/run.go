@@ -36,6 +36,7 @@ var (
 				NoWaitForHealthy:      noWaitForHealthy,
 				NoMinTimeToLeaderSlot: noMinTimeToLeaderSlot, // ignored when run on passive node
 				SkipTowerSync:         skipTowerSync,
+				SkipTowerFileCheck:    skipTowerFileCheck,
 				AutoConfirm:           autoConfirm,
 				RollbackEnabled:       rollbackEnabled,
 				ToPeer:                toPeer,
