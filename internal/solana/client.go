@@ -129,17 +129,15 @@ func (c *Client) NodeFromPubkey(pubkey string) (*Node, error) {
 func (c *Client) getClusterNodes() ([]*rpc.GetClusterNodesResult, error) {
 	nodes, err := c.localRPCClient.GetClusterNodes(context.Background())
 	if err != nil {
-		return nil, wrapGetClusterNodesErr(err)
+		var rpcErr *jsonrpc.RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == jsonRPCMethodNotFound {
+			// local validator not running with --full-rpc-api; fall back to network RPC
+			log.Warn().Msg("getClusterNodes unavailable on local RPC (start with --full-rpc-api to avoid this); falling back to network RPC")
+			return c.networkRPCClient.GetClusterNodes(context.Background())
+		}
+		return nil, err
 	}
 	return nodes, nil
-}
-
-func wrapGetClusterNodesErr(err error) error {
-	var rpcErr *jsonrpc.RPCError
-	if errors.As(err, &rpcErr) && rpcErr.Code == jsonRPCMethodNotFound {
-		return fmt.Errorf("%w; start the local validator with --full-rpc-api to enable getClusterNodes", err)
-	}
-	return err
 }
 
 func (c *Client) nodeFromIP(ip string) (node *rpc.GetClusterNodesResult, err error) {
