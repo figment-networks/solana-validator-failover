@@ -27,6 +27,8 @@ type TowerConfig struct {
 	Dir                  string `mapstructure:"dir"`
 	AutoEmptyWhenPassive bool   `mapstructure:"auto_empty_when_passive"`
 	FileNameTemplate     string `mapstructure:"file_name_template"`
+	// Alpenglow keeps per-identity vote history beside the tower file in the same dir.
+	VoteHistoryFileNameTemplate string `mapstructure:"vote_history_file_name_template"`
 }
 
 // FailoverConfig is the configuration for a failover

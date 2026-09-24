@@ -72,6 +72,7 @@ type Validator struct {
 	SetIdentityActiveCommand       string
 	SetIdentityPassiveCommand      string
 	TowerFile                      string
+	VoteHistoryFile                string
 	TowerFileAutoDeleteWhenPassive bool
 	Rollback                       hooks.RollbackConfig
 
@@ -384,6 +385,29 @@ func (v *Validator) configureTowerFile(cfg TowerConfig) error {
 	v.logger.Debug().
 		Str("tower_file", v.TowerFile).
 		Msg("tower file set")
+
+	voteHistoryFileNameTemplate, err := template.New("vote_history").Parse(cfg.VoteHistoryFileNameTemplate)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to parse vote history file name template %s: %w",
+			cfg.VoteHistoryFileNameTemplate,
+			err,
+		)
+	}
+
+	var voteHistoryFileNameBuf strings.Builder
+	if err := voteHistoryFileNameTemplate.Execute(&voteHistoryFileNameBuf, v); err != nil {
+		return fmt.Errorf(
+			"failed to execute vote history file name template %s: %w",
+			cfg.VoteHistoryFileNameTemplate,
+			err,
+		)
+	}
+
+	v.VoteHistoryFile = filepath.Join(towerDir, voteHistoryFileNameBuf.String())
+	v.logger.Debug().
+		Str("vote_history_file", v.VoteHistoryFile).
+		Msg("vote history file set")
 
 	return nil
 }
@@ -787,20 +811,21 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 			PublicIP:                       v.PublicIP,
 			Identities:                     v.Identities,
 			TowerFile:                      v.TowerFile,
+			VoteHistoryFile:                v.VoteHistoryFile,
 			SetIdentityCommand:             v.SetIdentityActiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
 			SolanaValidatorFailoverVersion: pkgconstants.AppVersion,
 			RPCAddress:                     v.RPCAddress,
 		},
-		SolanaRPCClient:  v.solanaRPCClient,
-		RPCURL:           v.RPCAddress,
-		IsDryRunFailover: !params.NotADrill,
-		Hooks:            v.Hooks,
-		Rollback:         v.Rollback,
+		SolanaRPCClient:      v.solanaRPCClient,
+		RPCURL:               v.RPCAddress,
+		IsDryRunFailover:     !params.NotADrill,
+		Hooks:                v.Hooks,
+		Rollback:             v.Rollback,
 		SkipTowerSync:        params.SkipTowerSync,
 		SkipVoteCreditsCheck: params.SkipVoteCreditsCheck,
 		AutoConfirm:          params.AutoConfirm,
-		TLSConfig:        v.serverTLSConfig,
+		TLSConfig:            v.serverTLSConfig,
 		MonitorConfig: failover.MonitorConfig{
 			CreditSamples: failover.CreditSamplesConfig{
 				Count:            v.MonitorConfig.CreditSamples.Count,
@@ -862,6 +887,8 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 			Identities:                     v.Identities,
 			TowerFile:                      v.TowerFile,
 			TowerFileSizeBytes:             utils.FileSize(v.TowerFile),
+			VoteHistoryFile:                v.VoteHistoryFile,
+			VoteHistoryFileSizeBytes:       utils.FileSize(v.VoteHistoryFile),
 			SetIdentityCommand:             v.SetIdentityPassiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
 			SolanaValidatorFailoverVersion: pkgconstants.AppVersion,

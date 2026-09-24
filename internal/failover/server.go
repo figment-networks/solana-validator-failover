@@ -35,15 +35,15 @@ type CreditSamplesConfig struct {
 
 // ServerConfig is the configuration for the failover server
 type ServerConfig struct {
-	Port              int
-	HeartbeatInterval string
-	StreamTimeout     string
-	PassiveNodeInfo   *NodeInfo
-	SolanaRPCClient   solana.ClientInterface
-	RPCURL            string
-	IsDryRunFailover  bool
-	Hooks             hooks.FailoverHooks
-	MonitorConfig     MonitorConfig
+	Port                 int
+	HeartbeatInterval    string
+	StreamTimeout        string
+	PassiveNodeInfo      *NodeInfo
+	SolanaRPCClient      solana.ClientInterface
+	RPCURL               string
+	IsDryRunFailover     bool
+	Hooks                hooks.FailoverHooks
+	MonitorConfig        MonitorConfig
 	SkipTowerSync        bool
 	SkipVoteCreditsCheck bool
 	AutoConfirm          bool
@@ -56,29 +56,29 @@ type ServerConfig struct {
 
 // Server is the failover server - run by the passive node
 type Server struct {
-	port              int
-	listenAddr        string
-	tlsConfig         *tls.Config
-	transport         *quic.Transport
-	listener          *quic.Listener
-	heartbeatInterval time.Duration
-	streamTimeout     time.Duration
-	ctx               context.Context
-	cancel            context.CancelFunc
-	logger            zerolog.Logger
-	passiveNodeInfo   *NodeInfo
-	solanaRPCClient   solana.ClientInterface
-	rpcURL            string
-	failoverStream    *Stream
-	isDryRunFailover  bool
-	activeConn        *quic.Conn
-	hooks             hooks.FailoverHooks
-	monitorConfig     MonitorConfig
+	port                 int
+	listenAddr           string
+	tlsConfig            *tls.Config
+	transport            *quic.Transport
+	listener             *quic.Listener
+	heartbeatInterval    time.Duration
+	streamTimeout        time.Duration
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	logger               zerolog.Logger
+	passiveNodeInfo      *NodeInfo
+	solanaRPCClient      solana.ClientInterface
+	rpcURL               string
+	failoverStream       *Stream
+	isDryRunFailover     bool
+	activeConn           *quic.Conn
+	hooks                hooks.FailoverHooks
+	monitorConfig        MonitorConfig
 	skipTowerSync        bool
 	skipVoteCreditsCheck bool
 	autoConfirm          bool
 	rollback             hooks.RollbackConfig
-	mtlsEnabled       bool
+	mtlsEnabled          bool
 }
 
 // NewServerFromConfig creates a new failover server from a configuration
@@ -103,22 +103,22 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		port:             config.Port,
-		tlsConfig:        serverTLSConfig,
-		mtlsEnabled:      mtlsEnabled,
-		logger:           log.With().Logger(),
-		ctx:              ctx,
-		cancel:           cancel,
-		passiveNodeInfo:  config.PassiveNodeInfo,
-		solanaRPCClient:  config.SolanaRPCClient,
-		rpcURL:           config.RPCURL,
-		isDryRunFailover: config.IsDryRunFailover,
-		hooks:            config.Hooks,
-		monitorConfig:    config.MonitorConfig,
+		port:                 config.Port,
+		tlsConfig:            serverTLSConfig,
+		mtlsEnabled:          mtlsEnabled,
+		logger:               log.With().Logger(),
+		ctx:                  ctx,
+		cancel:               cancel,
+		passiveNodeInfo:      config.PassiveNodeInfo,
+		solanaRPCClient:      config.SolanaRPCClient,
+		rpcURL:               config.RPCURL,
+		isDryRunFailover:     config.IsDryRunFailover,
+		hooks:                config.Hooks,
+		monitorConfig:        config.MonitorConfig,
 		skipTowerSync:        config.SkipTowerSync,
 		skipVoteCreditsCheck: config.SkipVoteCreditsCheck,
 		autoConfirm:          config.AutoConfirm,
-		rollback:         config.Rollback,
+		rollback:             config.Rollback,
 	}
 
 	if s.port == 0 {
@@ -443,53 +443,63 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 		return
 	}
 
-	if s.skipTowerSync {
+	// Alpenglow refuses set-identity unless this node holds the active identity's vote history,
+	// so it is synced alongside the tower file. Absent on pre-Alpenglow clusters.
+	syncVoteHistory := s.failoverStream.GetActiveNodeInfo().VoteHistoryFileSizeBytes > 0
+
+	if s.skipTowerSync && !syncVoteHistory {
 		s.logger.Info().Msg("Failover started - skipping tower file sync")
 	} else {
-		s.logger.Info().Msgf("Failover started - waiting for tower file from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
+		s.logger.Info().Msgf("Failover started - waiting for files from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
 
-		// Wait for the updated node info with tower file bytes
+		// Wait for the updated node info with the file bytes
 		if err := s.failoverStream.Decode(); err != nil {
 			s.logger.Error().Err(err).Msg("failed to decode updated node info")
 			return
 		}
 
-		// check that the TowerFileBytes sent are the same as the hash of the tower file
-		computedTowerFileHash := s.failoverStream.GetActiveNodeInfo().ComputeTowerFileHashFromBytes(s.failoverStream.GetActiveNodeInfo().TowerFileBytes)
-		expectedTowerFileHash := s.failoverStream.GetActiveNodeInfo().TowerFileHash
-
-		s.logger.Debug().Msgf("Checking tower file hash - received: %s expected: %s", computedTowerFileHash, expectedTowerFileHash)
-
-		if computedTowerFileHash != expectedTowerFileHash {
-			s.logger.Error().Msgf("tower file hash mismatch: (got: %s) != (expected: %s)", computedTowerFileHash, expectedTowerFileHash)
-			s.logger.Error().Msg("aborting failover - save it by running:")
-			fmt.Printf(
-				"  rsync -avz --no-perms --no-i-r --no-progress --no-motd --no-times -e ssh -i <YOUR-SSH-KEY> -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no %s@%s:%s %s \n",
-				os.Getenv("USER"),
-				s.failoverStream.GetActiveNodeInfo().Hostname,
-				s.failoverStream.GetActiveNodeInfo().TowerFile,
-				s.failoverStream.GetPassiveNodeInfo().TowerFile,
-			)
-			s.logger.Error().Msg("then run:")
-			fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
-			s.logger.Fatal().Msg("tower file hash mismatch - failover aborted")
+		if err := s.writeVoteHistoryFile(syncVoteHistory); err != nil {
 			return
 		}
 
-		// Write bytes and close immediately
-		if _, err := towerFile.Write(s.failoverStream.GetActiveNodeInfo().TowerFileBytes); err != nil {
-			s.logger.Error().Err(err).Msgf("failed to write tower file to %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-			return
-		}
+		if !s.skipTowerSync {
+			// check that the TowerFileBytes sent are the same as the hash of the tower file
+			computedTowerFileHash := s.failoverStream.GetActiveNodeInfo().ComputeTowerFileHashFromBytes(s.failoverStream.GetActiveNodeInfo().TowerFileBytes)
+			expectedTowerFileHash := s.failoverStream.GetActiveNodeInfo().TowerFileHash
 
-		// close the file handle - defer utils.SafeCloseFile() above won't conflict
-		if err := towerFile.Close(); err != nil {
-			s.logger.Error().Err(err).Msgf("failed to close tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-			return
-		}
+			s.logger.Debug().Msgf("Checking tower file hash - received: %s expected: %s", computedTowerFileHash, expectedTowerFileHash)
 
-		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
-		s.logger.Info().Msg("Received tower file")
+			if computedTowerFileHash != expectedTowerFileHash {
+				s.logger.Error().Msgf("tower file hash mismatch: (got: %s) != (expected: %s)", computedTowerFileHash, expectedTowerFileHash)
+				s.logger.Error().Msg("aborting failover - save it by running:")
+				fmt.Printf(
+					"  rsync -avz --no-perms --no-i-r --no-progress --no-motd --no-times -e ssh -i <YOUR-SSH-KEY> -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no %s@%s:%s %s \n",
+					os.Getenv("USER"),
+					s.failoverStream.GetActiveNodeInfo().Hostname,
+					s.failoverStream.GetActiveNodeInfo().TowerFile,
+					s.failoverStream.GetPassiveNodeInfo().TowerFile,
+				)
+				s.logger.Error().Msg("then run:")
+				fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
+				s.logger.Fatal().Msg("tower file hash mismatch - failover aborted")
+				return
+			}
+
+			// Write bytes and close immediately
+			if _, err := towerFile.Write(s.failoverStream.GetActiveNodeInfo().TowerFileBytes); err != nil {
+				s.logger.Error().Err(err).Msgf("failed to write tower file to %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
+				return
+			}
+
+			// close the file handle - defer utils.SafeCloseFile() above won't conflict
+			if err := towerFile.Close(); err != nil {
+				s.logger.Error().Err(err).Msgf("failed to close tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
+				return
+			}
+
+			s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
+			s.logger.Info().Msg("Received tower file")
+		}
 	}
 
 	// set identity to active
@@ -616,6 +626,36 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 		}
 	}
 	s.cancel()
+}
+
+// writeVoteHistoryFile verifies and writes the active identity's vote history file. Alpenglow's
+// set-identity refuses to promote a node that does not have it, and it is keyed on the identity,
+// so it must land before the identity is set.
+func (s *Server) writeVoteHistoryFile(syncVoteHistory bool) error {
+	if !syncVoteHistory {
+		return nil
+	}
+
+	activeNodeInfo := s.failoverStream.GetActiveNodeInfo()
+	destination := s.failoverStream.GetPassiveNodeInfo().VoteHistoryFile
+
+	computedHash := activeNodeInfo.ComputeTowerFileHashFromBytes(activeNodeInfo.VoteHistoryFileBytes)
+	if computedHash != activeNodeInfo.VoteHistoryFileHash {
+		err := fmt.Errorf(
+			"vote history file hash mismatch: (got: %s) != (expected: %s)",
+			computedHash, activeNodeInfo.VoteHistoryFileHash,
+		)
+		s.logger.Error().Err(err).Msg("aborting failover before identity change")
+		return err
+	}
+
+	if err := os.WriteFile(destination, activeNodeInfo.VoteHistoryFileBytes, 0o600); err != nil {
+		s.logger.Error().Err(err).Msgf("failed to write vote history file to %s", destination)
+		return err
+	}
+
+	s.logger.Info().Msg("Received vote history file")
+	return nil
 }
 
 // confirmGossipNodesPostFailover confirms that the gossip nodes have switched roles post-failover

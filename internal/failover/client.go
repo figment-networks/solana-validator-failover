@@ -232,22 +232,37 @@ func (c *Client) Start() {
 	c.failoverStream.SetActiveNodeSetIdentityEndTime()
 	wentPassive = true // this node is now passive; used below for rollback/warning decisions
 
-	if skipTowerSync {
+	// Alpenglow gates set-identity on the promote target holding this identity's vote history,
+	// so it must move with the identity even when the tower file is not being synced.
+	syncVoteHistory := c.failoverStream.GetActiveNodeInfo().HasVoteHistoryFile()
+
+	if skipTowerSync && !syncVoteHistory {
 		c.logger.Info().Msg("Skipping tower file sync")
-		// Don't send anything - server won't wait for tower file when skipTowerSync is true
+		// Don't send anything - server won't wait when neither file is being synced
 	} else {
-		c.logger.Info().Msgf("Sending tower file to %s", style.RenderPassiveString(c.failoverStream.GetPassiveNodeInfo().Hostname, false))
+		if !skipTowerSync {
+			c.logger.Info().Msgf("Sending tower file to %s", style.RenderPassiveString(c.failoverStream.GetPassiveNodeInfo().Hostname, false))
 
-		// Read the tower file into TowerFileBytes
-		c.failoverStream.SetActiveNodeSyncTowerFileStartTime()
-		err = c.failoverStream.GetActiveNodeInfo().SetTowerFileBytes()
-		if err != nil {
-			c.logger.Error().Err(err).Msgf("failed to set tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile)
-			return
+			// Read the tower file into TowerFileBytes
+			c.failoverStream.SetActiveNodeSyncTowerFileStartTime()
+			err = c.failoverStream.GetActiveNodeInfo().SetTowerFileBytes()
+			if err != nil {
+				c.logger.Error().Err(err).Msgf("failed to set tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile)
+				return
+			}
+			c.failoverStream.SetActiveNodeSyncTowerFileEndTime()
 		}
-		c.failoverStream.SetActiveNodeSyncTowerFileEndTime()
 
-		// Send the updated node info with tower file bytes
+		if syncVoteHistory {
+			c.logger.Info().Msgf("Sending vote history file to %s", style.RenderPassiveString(c.failoverStream.GetPassiveNodeInfo().Hostname, false))
+
+			if err = c.failoverStream.GetActiveNodeInfo().SetVoteHistoryFileBytes(); err != nil {
+				c.logger.Error().Err(err).Msgf("failed to set vote history file bytes for %s", c.failoverStream.GetActiveNodeInfo().VoteHistoryFile)
+				return
+			}
+		}
+
+		// Send the updated node info with the file bytes
 		if err := c.failoverStream.Encode(); err != nil {
 			c.logger.Error().Err(err).Msgf("failed to send tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile)
 			if wentPassive {
