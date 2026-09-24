@@ -42,6 +42,10 @@ const (
 	// DefaultTowerFileNameTemplate is the default tower file name template for the validator
 	DefaultTowerFileNameTemplate = "tower-1_9-{{ .Identities.Active.PubKey }}.bin"
 
+	// DefaultVoteHistoryFileNameTemplate is the default vote history file name template for the
+	// validator. Matches FileVoteHistoryStorage::filename in agave votor/src/vote_history_storage.rs.
+	DefaultVoteHistoryFileNameTemplate = "vote_history-{{ .Identities.Active.PubKey }}.bin"
+
 	// DefaultSetIdentityPassiveCmdTemplate is the default set identity passive command template for the validator
 	DefaultSetIdentityPassiveCmdTemplate = "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Passive.KeyFile }}"
 
@@ -102,6 +106,7 @@ func (s *SolanaValidatorFailover) LoadFromConfigFile(configPath string) (err err
 	v.SetDefault("validator.failover.set_identity_active_cmd_template", DefaultSetIdentityActiveCmdTemplate)
 	v.SetDefault("validator.failover.set_identity_passive_cmd_template", DefaultSetIdentityPassiveCmdTemplate)
 	v.SetDefault("validator.tower.file_name_template", DefaultTowerFileNameTemplate)
+	v.SetDefault("validator.tower.vote_history_file_name_template", DefaultVoteHistoryFileNameTemplate)
 
 	// Read config file
 	logger.Debug().Str("config_file", loadConfigPath).Msg("loading")
