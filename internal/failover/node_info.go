@@ -1,6 +1,7 @@
 package failover
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -22,10 +23,10 @@ type NodeInfo struct {
 	RPCAddress                     string
 }
 
-// SetTowerFileBytes sets the tower file bytes
-func (n *NodeInfo) SetTowerFileBytes() error {
+// SetTowerFileBytes sets the tower file bytes; with allowMissing a missing file sends an empty tower
+func (n *NodeInfo) SetTowerFileBytes(allowMissing bool) error {
 	towerFileBytes, err := os.ReadFile(n.TowerFile)
-	if err != nil {
+	if err != nil && !(allowMissing && errors.Is(err, os.ErrNotExist)) {
 		return fmt.Errorf("failed to read tower file: %w", err)
 	}
 	n.TowerFileBytes = towerFileBytes

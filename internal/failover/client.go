@@ -34,6 +34,7 @@ type ClientConfig struct {
 	SolanaRPCClient                solana.ClientInterface
 	RPCURL                         string
 	SkipTowerSync                  bool
+	AllowMissingTowerFile          bool
 }
 
 // Client is the failover client - an active node connects to a passive node server to handover as active
@@ -53,6 +54,7 @@ type Client struct {
 	serverName                     string
 	serverAddress                  string
 	skipTowerSync                  bool
+	allowMissingTowerFile          bool
 }
 
 // NewClientFromConfig creates a new QUIC client from a configuration
@@ -73,6 +75,7 @@ func NewClientFromConfig(config ClientConfig) (client *Client, err error) {
 		serverName:                     config.ServerName,
 		serverAddress:                  config.ServerAddress,
 		skipTowerSync:                  config.SkipTowerSync,
+		allowMissingTowerFile:          config.AllowMissingTowerFile,
 	}
 
 	err = client.connectToServer()
@@ -209,7 +212,8 @@ func (c *Client) Start() {
 
 		// Read the tower file into TowerFileBytes
 		c.failoverStream.SetActiveNodeSyncTowerFileStartTime()
-		err = c.failoverStream.GetActiveNodeInfo().SetTowerFileBytes()
+		// still sent when empty: the server waits for this message before going active
+		err = c.failoverStream.GetActiveNodeInfo().SetTowerFileBytes(c.allowMissingTowerFile)
 		if err != nil {
 			c.logger.Error().Err(err).Msgf("failed to set tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile)
 			return
