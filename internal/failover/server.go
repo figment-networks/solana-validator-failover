@@ -421,6 +421,14 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 			return
 		}
 
+		// an empty tower means the active node has none (e.g. native Firedancer); don't leave a 0-byte file
+		if len(s.failoverStream.GetActiveNodeInfo().TowerFileBytes) == 0 {
+			// warn only: the active node is already passive, aborting here would leave both passive
+			if err := utils.RemoveFile(s.failoverStream.GetPassiveNodeInfo().TowerFile); err != nil {
+				s.logger.Warn().Err(err).Msgf("failed to remove empty tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
+			}
+		}
+
 		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
 		s.logger.Info().Msg("👉 Received tower file")
 	}

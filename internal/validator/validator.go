@@ -735,6 +735,7 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 		SolanaRPCClient:                v.solanaRPCClient,
 		RPCURL:                         v.RPCAddress,
 		SkipTowerSync:                  params.SkipTowerSync,
+		AllowMissingTowerFile:          params.SkipTowerFileCheck,
 		ActiveNodeInfo: &failover.NodeInfo{
 			Hostname:                       v.Hostname,
 			PublicIP:                       v.PublicIP,
