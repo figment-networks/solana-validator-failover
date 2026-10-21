@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gagliardetto/solana-go"
-	"github.com/rs/zerolog/log"
+	"github.com/charmbracelet/log"
+	"github.com/solana-foundation/solana-go/v2"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/identities"
 	solanapkg "github.com/sol-strategies/solana-validator-failover/internal/solana"
@@ -46,18 +46,14 @@ func (tv *TestValidator) GetHostname() (string, error) {
 // configurePublicIP overrides the method for testing to use mocked values
 func (tv *TestValidator) configurePublicIP() (err error) {
 	tv.PublicIP = tv.mockPublicIP
-	tv.logger.Debug().
-		Str("public_ip", tv.PublicIP).
-		Msg("public ip set")
+	tv.logger.Debug("public ip set", "public_ip", tv.PublicIP)
 	return nil
 }
 
 // configureHostname overrides the method for testing to use mocked values
 func (tv *TestValidator) configureHostname() (err error) {
 	tv.Hostname = tv.mockHostname
-	tv.logger.Debug().
-		Str("hostname", tv.Hostname).
-		Msg("hostname set")
+	tv.logger.Debug("hostname set", "hostname", tv.Hostname)
 	return nil
 }
 
@@ -67,19 +63,19 @@ func (tv *TestValidator) configureGossipNode() (err error) {
 	if err != nil {
 		return err
 	}
-	tv.logger.Debug().
-		Str("public_ip", tv.GossipNode.IP()).
-		Str("pubkey", tv.GossipNode.PubKey()).
-		Msg("gossip node set")
+	tv.logger.Debug("gossip node set",
+		"public_ip", tv.GossipNode.IP(),
+		"pubkey", tv.GossipNode.PubKey(),
+	)
 	return nil
 }
 
 // NewFromConfig overrides the method for testing to use mocked configure methods
 func (tv *TestValidator) NewFromConfig(cfg *Config) error {
-	tv.logger.Debug().Msg("================================================")
-	tv.logger.Debug().Msg("configuring...")
-	defer tv.logger.Debug().Msg("================================================")
-	defer tv.logger.Debug().Msg("configuration done")
+	tv.logger.Debug("================================================")
+	tv.logger.Debug("configuring...")
+	defer tv.logger.Debug("================================================")
+	defer tv.logger.Debug("configuration done")
 
 	// configure solana rpc clients all in one
 	err := tv.configureRPCClient(cfg.RPCAddress, cfg.Cluster, cfg.ClusterRPCURL, cfg.AverageSlotDuration)
@@ -207,7 +203,7 @@ func createDummyAgaveValidator(t *testing.T) string {
 func createTestValidator(t *testing.T) *TestValidator {
 	return &TestValidator{
 		Validator: &Validator{
-			logger: log.With().Str("component", "validator").Logger(),
+			logger: log.WithPrefix("validator"),
 		},
 		mockPublicIP:     "192.168.1.100",
 		mockHostname:     "test-validator",
@@ -262,6 +258,33 @@ func TestConfigureRPCClient_CustomCluster_MissingClusterRPCURL(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cluster_rpc_url is required")
+}
+
+func TestResolveClusterRPCURL_KnownClusterDefault(t *testing.T) {
+	url, err := resolveClusterRPCURL("mainnet-beta", "")
+
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.mainnet-beta.solana.com", url)
+}
+
+func TestResolveClusterRPCURL_KnownClusterOverride(t *testing.T) {
+	url, err := resolveClusterRPCURL("mainnet-beta", "https://private-rpc.example.com")
+
+	require.NoError(t, err)
+	assert.Equal(t, "https://private-rpc.example.com", url)
+}
+
+func TestResolveClusterRPCURL_CustomCluster(t *testing.T) {
+	url, err := resolveClusterRPCURL("custom-mainnet", "https://custom-rpc.example.com")
+
+	require.NoError(t, err)
+	assert.Equal(t, "https://custom-rpc.example.com", url)
+}
+
+func TestRPCURLForLog_RedactsCredentialsAndPath(t *testing.T) {
+	loggedURL := rpcURLForLog("https://user:secret@private-rpc.example.com/v1/key?api-key=secret")
+
+	assert.Equal(t, "https://private-rpc.example.com", loggedURL)
 }
 
 // ============================================================================
@@ -600,7 +623,7 @@ func TestNewFromConfig_Success(t *testing.T) {
 	// Create test validator with mocked dependencies
 	testValidator := &TestValidator{
 		Validator: &Validator{
-			logger: log.With().Str("component", "validator").Logger(),
+			logger: log.WithPrefix("validator"),
 		},
 		mockPublicIP:     "192.168.1.100",
 		mockHostname:     "test-validator",

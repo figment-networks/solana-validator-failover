@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/rs/zerolog/log"
+	"github.com/charmbracelet/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/utils"
 	"github.com/sol-strategies/solana-validator-failover/internal/validator"
 	"github.com/sol-strategies/solana-validator-failover/pkg/constants"
@@ -42,10 +42,6 @@ const (
 	// DefaultTowerFileNameTemplate is the default tower file name template for the validator
 	DefaultTowerFileNameTemplate = "tower-1_9-{{ .Identities.Active.PubKey }}.bin"
 
-	// DefaultVoteHistoryFileNameTemplate is the default vote history file name template for the
-	// validator. Matches FileVoteHistoryStorage::filename in agave votor/src/vote_history_storage.rs.
-	DefaultVoteHistoryFileNameTemplate = "vote_history-{{ .Identities.Active.PubKey }}.bin"
-
 	// DefaultSetIdentityPassiveCmdTemplate is the default set identity passive command template for the validator
 	DefaultSetIdentityPassiveCmdTemplate = "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Passive.KeyFile }}"
 
@@ -58,9 +54,16 @@ var (
 	DefaultConfigPath = filepath.Join("~", constants.AppName, constants.AppName+".yaml")
 )
 
+// UpdateConfig holds update-check settings
+type UpdateConfig struct {
+	CheckOnStartup bool `mapstructure:"check_on_startup"`
+}
+
 // SolanaValidatorFailover is the configuration for the program
 type SolanaValidatorFailover struct {
+	Log       LogConfig        `mapstructure:"log"`
 	Validator validator.Config `mapstructure:"validator"`
+	Update    UpdateConfig     `mapstructure:"update"`
 }
 
 // NewFromFile creates a new SolanaValidatorFailover configuration from a config file
@@ -77,7 +80,7 @@ func NewFromFile(configPath string) (s *SolanaValidatorFailover, err error) {
 
 // LoadFromConfigFile loads the config from a config file
 func (s *SolanaValidatorFailover) LoadFromConfigFile(configPath string) (err error) {
-	logger := log.With().Str("component", "config").Logger()
+	logger := log.WithPrefix("config")
 	v := viper.New()
 
 	loadConfigPath := DefaultConfigPath
@@ -94,27 +97,39 @@ func (s *SolanaValidatorFailover) LoadFromConfigFile(configPath string) (err err
 	v.SetConfigFile(loadConfigPath)
 
 	// Set defaults
+	v.SetDefault("log.level", DefaultLogLevel)
+	v.SetDefault("log.format", DefaultLogFormat)
 	v.SetDefault("validator.bin", DefaultBin)
 	v.SetDefault("validator.average_slot_duration", DefaultAverageSlotDuration)
 	v.SetDefault("validator.cluster", DefaultCluster)
 	v.SetDefault("validator.failover.min_time_to_leader_slot", DefaultFailoverMinimumTimeToLeaderSlot)
+	v.SetDefault("validator.failover.consensus.mode", "tower")
 	v.SetDefault("validator.failover.monitor.credit_samples.count", DefaultFailoverMonitorCreditSamplesCount)
 	v.SetDefault("validator.failover.monitor.credit_samples.interval", DefaultFailoverMonitorCreditSamplesInterval)
 	v.SetDefault("validator.failover.server.heartbeat_interval", DefaultFailoverServerHeartbeatInterval)
 	v.SetDefault("validator.failover.server.port", DefaultFailoverServerPort)
 	v.SetDefault("validator.failover.server.stream_timeout", DefaultFailoverServerStreamTimeout)
-	v.SetDefault("validator.failover.set_identity_active_cmd_template", DefaultSetIdentityActiveCmdTemplate)
 	v.SetDefault("validator.failover.set_identity_passive_cmd_template", DefaultSetIdentityPassiveCmdTemplate)
 	v.SetDefault("validator.tower.file_name_template", DefaultTowerFileNameTemplate)
-	v.SetDefault("validator.tower.vote_history_file_name_template", DefaultVoteHistoryFileNameTemplate)
+	v.SetDefault("update.check_on_startup", true)
 
 	// Read config file
-	logger.Debug().Str("config_file", loadConfigPath).Msg("loading")
+	logger.Debug("loading", "config_file", loadConfigPath)
 	err = v.ReadInConfig()
 	if err != nil {
 		return
 	}
 
 	// Unmarshal into the full config structure
-	return v.Unmarshal(&s)
+	if err := v.Unmarshal(s); err != nil {
+		return err
+	}
+	if s.Validator.Failover.SetIdentityActiveCmdTemplate == "" {
+		s.Validator.Failover.SetIdentityActiveCmdTemplate = DefaultSetIdentityActiveCmdTemplate
+		if s.Validator.Failover.Consensus.Mode == "alpenglow" {
+			s.Validator.Failover.SetIdentityActiveCmdTemplate = "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Active.KeyFile }}"
+		}
+	}
+
+	return s.Log.Validate()
 }

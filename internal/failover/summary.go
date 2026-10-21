@@ -45,6 +45,7 @@ type SummaryData struct {
 // RenderFailoverSummary renders the post-failover summary to a string.
 func RenderFailoverSummary(data SummaryData) (string, error) {
 	funcMap := template.FuncMap{
+		"stateLabel": stateLabel,
 		// truncPubkey uses ASCII "..." so byte-length == display-width.
 		"truncPubkey": func(s string) string {
 			if len(s) <= 16 {
@@ -77,6 +78,9 @@ func RenderFailoverSummary(data SummaryData) (string, error) {
 			if n == 0 {
 				return ", same slot"
 			}
+			if n == 1 {
+				return ", over 1 slot"
+			}
 			return fmt.Sprintf(", over %s slots", humanize.Comma(int64(n)))
 		},
 		// PadRight pads s with trailing spaces to the given width (ASCII labels only).
@@ -93,29 +97,29 @@ func RenderFailoverSummary(data SummaryData) (string, error) {
 	// timing info on each header line aligns vertically.
 	labelWidth := max(len(data.OrigActiveNode.Hostname), len(data.OrigPassiveNode.Hostname))
 	if !data.SkipTowerSync {
-		labelWidth = max(labelWidth, len("> tower"))
+		labelWidth = max(labelWidth, len("> "+stateLabel(data.OrigActiveNode.Consensus)))
 	}
 
 	tpl, err := template.New("failoverSummary").Funcs(funcMap).Parse(`
   {{ Passive .OrigActiveNode.Hostname true }}
-        role     = {{ Passive "passive" false }}
-        identity = {{ Passive (truncPubkey .OrigActiveNode.Identities.Passive.PubKey) false }}
-        ip       = {{ LightGrey .OrigActiveNode.PublicIP }}
-        took     = {{ LightGrey (FormatDuration .OrigActiveSetIdentityDuration) }}
-        at_slot  = {{ LightGrey (FormatSlot .FailoverStartSlot) }}
+        {{ Muted "role     =" }} {{ Passive "passive" false }}
+        {{ Muted "identity =" }} {{ Passive (truncPubkey .OrigActiveNode.Identities.Passive.PubKey) false }}
+        {{ Muted "ip       =" }} {{ LightGrey .OrigActiveNode.PublicIP }}
+        {{ Muted "took     =" }} {{ LightGrey (FormatDuration .OrigActiveSetIdentityDuration) }}
+        {{ Muted "at_slot  =" }} {{ LightGrey (FormatSlot .FailoverStartSlot) }}
 {{ if not .SkipTowerSync }}
-  {{ LightGrey "tower" }}
-        took     = {{ LightGrey (FormatDuration .TowerSyncDuration) }}
-        size     = {{ LightGrey (FormatBytes .TowerFileSizeBytes) }}
+  {{ LightGrey (stateLabel .OrigActiveNode.Consensus) }}
+        {{ Muted "took     =" }} {{ LightGrey (FormatDuration .TowerSyncDuration) }}
+        {{ Muted "size     =" }} {{ LightGrey (FormatBytes .TowerFileSizeBytes) }}
 {{ end }}
   {{ Active .OrigPassiveNode.Hostname true }}
-        role     = {{ Active "active" false }}
-        identity = {{ Active (truncPubkey .OrigPassiveNode.Identities.Active.PubKey) false }}
-        ip       = {{ LightGrey .OrigPassiveNode.PublicIP }}
-        took     = {{ LightGrey (FormatDuration .OrigPassiveSetIdentityDuration) }}
-        at_slot  = {{ LightGrey (FormatSlot .FailoverEndSlot) }}
+        {{ Muted "role     =" }} {{ Active "active" false }}
+        {{ Muted "identity =" }} {{ Active (truncPubkey .OrigPassiveNode.Identities.Active.PubKey) false }}
+        {{ Muted "ip       =" }} {{ LightGrey .OrigPassiveNode.PublicIP }}
+        {{ Muted "took     =" }} {{ LightGrey (FormatDuration .OrigPassiveSetIdentityDuration) }}
+        {{ Muted "at_slot  =" }} {{ LightGrey (FormatSlot .FailoverEndSlot) }}
 {{ if .HasVoteRankData }}
-  {{ Purple "Vote credits:" }} rank {{ if gt .VoteRankDiff 0 }}{{ Active (printf "improved by +%d" .VoteRankDiff) false }}{{ else if lt .VoteRankDiff 0 }}{{ Passive (printf "worsened by %d" .VoteRankDiff) false }}{{ else }}{{ LightGrey "unchanged" }}{{ end }} ({{ .VoteRankFirst }} → {{ .VoteRankLast }})
+  {{ Purple "Vote credits:" }} {{ Muted "rank" }} {{ if gt .VoteRankDiff 0 }}{{ Active (printf "improved by +%d" .VoteRankDiff) false }}{{ else if lt .VoteRankDiff 0 }}{{ Passive (printf "worsened by %d" .VoteRankDiff) false }}{{ else }}{{ LightGrey "unchanged" }}{{ end }} {{ Muted (printf "(%d → %d)" .VoteRankFirst .VoteRankLast) }}
 {{ end }}
   {{ if .IsDryRun }}{{ Blue (printf "✓ Dry run complete in %s%s" (FormatDuration .TotalDuration) (SlotsSuffix .SlotsDuration)) }}{{ else }}{{ Active (printf "✓ Failover complete in %s%s" (FormatDuration .TotalDuration) (SlotsSuffix .SlotsDuration)) false }}{{ end }}
 `)

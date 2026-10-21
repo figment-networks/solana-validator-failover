@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,8 +14,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"github.com/charmbracelet/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/constants"
 	"github.com/sol-strategies/solana-validator-failover/internal/failover"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
@@ -32,7 +32,6 @@ type FailoverParams struct {
 	NoMinTimeToLeaderSlot bool
 	MinTimeToLeaderSlot   time.Duration
 	SkipTowerSync         bool
-	SkipTowerFileCheck    bool
 	SkipVoteCreditsCheck  bool
 	AutoConfirm           bool   // -y/--yes: skip all interactive confirmations
 	ToPeer                string // --to-peer: auto-select peer by name or IP (active node only)
@@ -65,6 +64,7 @@ type Validator struct {
 	Hostname                       string
 	Identities                     *identities.Identities
 	LedgerDir                      string
+	Consensus                      string
 	MinimumTimeToLeaderSlot        time.Duration
 	Peers                          Peers
 	PublicIP                       string
@@ -72,11 +72,10 @@ type Validator struct {
 	SetIdentityActiveCommand       string
 	SetIdentityPassiveCommand      string
 	TowerFile                      string
-	VoteHistoryFile                string
 	TowerFileAutoDeleteWhenPassive bool
 	Rollback                       hooks.RollbackConfig
 
-	logger          zerolog.Logger
+	logger          *log.Logger
 	solanaRPCClient solana.ClientInterface
 	serverTLSConfig *gotls.Config // non-nil when mTLS is enabled; used by the passive QUIC server
 	clientTLSConfig *gotls.Config // non-nil when mTLS is enabled; used by the active QUIC client
@@ -90,7 +89,7 @@ func (v *Validator) NewSolanaRPCClient(params solana.NewClientParams) solana.Cli
 // NewFromConfig creates a new validator from a config
 func NewFromConfig(cfg *Config) (*Validator, error) {
 	validator := &Validator{
-		logger: log.With().Str("component", "validator").Logger(),
+		logger: log.WithPrefix("validator"),
 	}
 	err := validator.NewFromConfig(cfg)
 	if err != nil {
@@ -102,10 +101,10 @@ func NewFromConfig(cfg *Config) (*Validator, error) {
 // NewFromConfig initializes the validator from a config
 func (v *Validator) NewFromConfig(cfg *Config) error {
 
-	log.Debug().Msg("================================================")
-	v.logger.Debug().Msg("configuring...")
-	defer log.Debug().Msg("================================================")
-	defer v.logger.Debug().Msg("configuration done")
+	log.Debug("================================================")
+	v.logger.Debug("configuring...")
+	defer log.Debug("================================================")
+	defer v.logger.Debug("configuration done")
 
 	// configure solana rpc clients all in one
 	err := v.configureRPCClient(cfg.RPCAddress, cfg.Cluster, cfg.ClusterRPCURL, cfg.AverageSlotDuration)
@@ -132,15 +131,35 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	}
 
 	// tower file configure
-	err = v.configureTowerFile(cfg.Tower)
-	if err != nil {
-		return err
+	v.Consensus = cfg.Failover.Consensus.Mode
+	if v.Consensus == "" {
+		v.Consensus = "tower"
+	}
+	if v.Consensus != "tower" && v.Consensus != "alpenglow" {
+		return fmt.Errorf("validator.failover.consensus.mode must be tower or alpenglow, got %q", v.Consensus)
+	}
+	if err := failover.ValidateConsensus(v.RPCAddress, v.Consensus); err != nil {
+		return fmt.Errorf("failed to validate configured consensus mode against local RPC: %w", err)
+	}
+	if v.Consensus == "tower" {
+		if err = v.configureTowerFile(cfg.Tower); err != nil {
+			return err
+		}
+	} else {
+		v.TowerFile = filepath.Join(v.LedgerDir, "vote_history-"+v.Identities.Active.PubKey()+".bin")
 	}
 
 	// set identity commands configure
 	err = v.configureSetIdenttiyCommands(cfg.Failover)
 	if err != nil {
 		return err
+	}
+	if v.Consensus == "alpenglow" {
+		for _, cmd := range []string{v.SetIdentityActiveCommand, v.SetIdentityPassiveCommand} {
+			if err := validateAlpenglowCommand(cmd); err != nil {
+				return err
+			}
+		}
 	}
 
 	// configure hooks
@@ -153,6 +172,13 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	err = v.configureRollback(cfg.Failover)
 	if err != nil {
 		return err
+	}
+	if v.Consensus == "alpenglow" {
+		for _, cmd := range []string{v.Rollback.ToActive.ResolvedCmd, v.Rollback.ToPassive.ResolvedCmd} {
+			if err := validateAlpenglowCommand(cmd); err != nil {
+				return err
+			}
+		}
 	}
 
 	// must have at least one peer, each peer must have a valid string <host>:<port>
@@ -212,42 +238,43 @@ func (v *Validator) IsPassive() bool {
 
 // Failover runs the failover process
 func (v *Validator) Failover(params FailoverParams) (err error) {
-	log.Debug().Msg("running failover")
-	defer log.Debug().Msg("run failover done")
+	log.Debug("running failover")
+	defer log.Debug("run failover done")
 
-	log.Debug().Msgf("failover with params: %+v", params)
-
+	log.Debugf("failover with params: %+v", params)
+	if v.Consensus == "alpenglow" && params.SkipTowerSync {
+		return fmt.Errorf("--skip-tower-sync is unavailable with alpenglow consensus")
+	}
 	// wait until healthy unless told otherwise
 	if params.NoWaitForHealthy {
-		log.Debug().Msg("--no-wait-for-healthy flag is set, skipping wait for healthy")
+		log.Debug("--no-wait-for-healthy flag is set, skipping wait for healthy")
 	} else {
 		err = v.waitUntilHealthy()
 		if err != nil {
 			return fmt.Errorf("failed to wait until healthy: %w", err)
 		}
 	}
-
 	params.MinTimeToLeaderSlot = v.MinimumTimeToLeaderSlot
 
 	if params.RollbackEnabled && !v.Rollback.Enabled {
-		log.Debug().Msg("--rollback-enabled flag set: overriding rollback.enabled to true")
+		log.Debug("--rollback-enabled flag set: overriding rollback.enabled to true")
 		v.Rollback.Enabled = true
 	}
 
 	if v.IsActive() {
 		if params.AutoConfirm && params.ToPeer != "" {
-			log.Warn().Msg("non-interactive mode: --yes and --to-peer are both set, all prompts will be skipped")
+			log.Warn("non-interactive mode: --yes and --to-peer are both set, all prompts will be skipped")
 		}
 		if params.AutoConfirm {
 			// --yes has no confirmations to skip on the active path, but it's not an error
-			log.Debug().Msg("--yes flag set (active node: no confirmations in this path)")
+			log.Debug("--yes flag set (active node: no confirmations in this path)")
 		}
 		return v.makePassive(params)
 	}
 
 	// passive node path
 	if params.ToPeer != "" {
-		log.Warn().Str("to_peer", params.ToPeer).Msg("--to-peer flag is only applicable when run on an active node - ignoring")
+		log.Warn("--to-peer flag is only applicable when run on an active node - ignoring", "to_peer", params.ToPeer)
 	}
 	return v.makeActive(params)
 }
@@ -265,20 +292,11 @@ func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName, clusterRP
 		)
 	}
 
-	// determine the cluster RPC URL: use built-in URL for known clusters,
-	// otherwise require cluster_rpc_url from config
-	var solanaClusterRPCURL string
-	if utils.IsKnownCluster(solanaClusterName) {
-		solanaClusterRPCURL = constants.SolanaClusters[solanaClusterName].RPC
-	} else {
-		if clusterRPCURL == "" {
-			return fmt.Errorf(
-				"cluster_rpc_url is required for custom cluster %q (known clusters: %s)",
-				solanaClusterName,
-				strings.Join(constants.SolanaClusterNames, ", "),
-			)
-		}
-		solanaClusterRPCURL = clusterRPCURL
+	// An explicit cluster RPC URL overrides the built-in endpoint for known clusters.
+	// This allows operators to use a private endpoint that supports getClusterNodes.
+	solanaClusterRPCURL, err := resolveClusterRPCURL(solanaClusterName, clusterRPCURL)
+	if err != nil {
+		return err
 	}
 
 	avgSlotDuration, err := time.ParseDuration(averageSlotDuration)
@@ -286,11 +304,11 @@ func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName, clusterRP
 		return fmt.Errorf("invalid average_slot_duration %q: %w", averageSlotDuration, err)
 	}
 
-	v.logger.Debug().
-		Str("cluster", solanaClusterName).
-		Str("local_rpc_url", localRPCURL).
-		Str("cluster_rpc_url", solanaClusterRPCURL).
-		Msg("rpc client configured")
+	v.logger.Debug("rpc client configured",
+		"cluster", solanaClusterName,
+		"local_rpc_url", rpcURLForLog(localRPCURL),
+		"cluster_rpc_url", rpcURLForLog(solanaClusterRPCURL),
+	)
 
 	v.RPCAddress = localRPCURL
 	v.solanaRPCClient = v.NewSolanaRPCClient(solana.NewClientParams{
@@ -302,6 +320,28 @@ func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName, clusterRP
 	return nil
 }
 
+func rpcURLForLog(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return "<configured>"
+	}
+	return parsedURL.Scheme + "://" + parsedURL.Host
+}
+
+func resolveClusterRPCURL(solanaClusterName, clusterRPCURL string) (string, error) {
+	if clusterRPCURL != "" {
+		return clusterRPCURL, nil
+	}
+	if utils.IsKnownCluster(solanaClusterName) {
+		return constants.SolanaClusters[solanaClusterName].RPC, nil
+	}
+	return "", fmt.Errorf(
+		"cluster_rpc_url is required for custom cluster %q (known clusters: %s)",
+		solanaClusterName,
+		strings.Join(constants.SolanaClusterNames, ", "),
+	)
+}
+
 // configureBin ensures the validator binary exists and sets it
 func (v *Validator) configureBin(bin string) error {
 	err := utils.EnsureBins(bin)
@@ -309,9 +349,7 @@ func (v *Validator) configureBin(bin string) error {
 		return err
 	}
 	v.Bin = bin
-	v.logger.Debug().
-		Str("bin", v.Bin).
-		Msg("validator binary set")
+	v.logger.Debug("validator binary set", "bin", v.Bin)
 	return nil
 }
 
@@ -322,9 +360,16 @@ func (v *Validator) configureLedgerDir(ledgerDir string) error {
 		return err
 	}
 	v.LedgerDir = ledgerDir
-	v.logger.Debug().
-		Str("ledger_dir", v.LedgerDir).
-		Msg("ledger dir set")
+	v.logger.Debug("ledger dir set", "ledger_dir", v.LedgerDir)
+	return nil
+}
+
+func validateAlpenglowCommand(command string) error {
+	for _, field := range strings.Fields(command) {
+		if field == "--require-tower" || field == "--do-not-require-vote-history" {
+			return fmt.Errorf("alpenglow identity command contains %s; remove it from validator.failover command templates", field)
+		}
+	}
 	return nil
 }
 
@@ -335,12 +380,12 @@ func (v *Validator) configureIdentities(identitiesConfig identities.Config) (err
 		return err
 	}
 
-	v.logger.Debug().
-		Str("active_pubkey", v.Identities.Active.PubKey()).
-		Str("active_keyfile", v.Identities.Active.KeyFile).
-		Str("passive_pubkey", v.Identities.Passive.PubKey()).
-		Str("passive_keyfile", v.Identities.Passive.KeyFile).
-		Msg("identities set")
+	v.logger.Debug("identities set",
+		"active_pubkey", v.Identities.Active.PubKey(),
+		"active_keyfile", v.Identities.Active.KeyFile,
+		"passive_pubkey", v.Identities.Passive.PubKey(),
+		"passive_keyfile", v.Identities.Passive.KeyFile,
+	)
 
 	return nil
 }
@@ -348,9 +393,9 @@ func (v *Validator) configureIdentities(identitiesConfig identities.Config) (err
 // configureTowerFile ensures the tower file is valid and sets it
 func (v *Validator) configureTowerFile(cfg TowerConfig) error {
 	v.TowerFileAutoDeleteWhenPassive = cfg.AutoEmptyWhenPassive
-	v.logger.Debug().
-		Bool("tower_file_auto_delete_when_passive", v.TowerFileAutoDeleteWhenPassive).
-		Msg("tower file auto delete when passive set")
+	v.logger.Debug("tower file auto delete when passive set",
+		"tower_file_auto_delete_when_passive", v.TowerFileAutoDeleteWhenPassive,
+	)
 
 	// tower dir must exist
 	towerDir, err := utils.ResolveAndValidateDir(cfg.Dir)
@@ -367,9 +412,7 @@ func (v *Validator) configureTowerFile(cfg TowerConfig) error {
 			err,
 		)
 	}
-	v.logger.Debug().
-		Str("template", cfg.FileNameTemplate).
-		Msg("tower file name template set")
+	v.logger.Debug("tower file name template set", "template", cfg.FileNameTemplate)
 
 	// tower file name template must compile
 	var towerFileNameBuf strings.Builder
@@ -382,32 +425,7 @@ func (v *Validator) configureTowerFile(cfg TowerConfig) error {
 	}
 
 	v.TowerFile = filepath.Join(towerDir, towerFileNameBuf.String())
-	v.logger.Debug().
-		Str("tower_file", v.TowerFile).
-		Msg("tower file set")
-
-	voteHistoryFileNameTemplate, err := template.New("vote_history").Parse(cfg.VoteHistoryFileNameTemplate)
-	if err != nil {
-		return fmt.Errorf(
-			"failed to parse vote history file name template %s: %w",
-			cfg.VoteHistoryFileNameTemplate,
-			err,
-		)
-	}
-
-	var voteHistoryFileNameBuf strings.Builder
-	if err := voteHistoryFileNameTemplate.Execute(&voteHistoryFileNameBuf, v); err != nil {
-		return fmt.Errorf(
-			"failed to execute vote history file name template %s: %w",
-			cfg.VoteHistoryFileNameTemplate,
-			err,
-		)
-	}
-
-	v.VoteHistoryFile = filepath.Join(towerDir, voteHistoryFileNameBuf.String())
-	v.logger.Debug().
-		Str("vote_history_file", v.VoteHistoryFile).
-		Msg("vote history file set")
+	v.logger.Debug("tower file set", "tower_file", v.TowerFile)
 
 	return nil
 }
@@ -429,9 +447,7 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 			err,
 		)
 	}
-	v.logger.Debug().
-		Str("template", cfg.SetIdentityActiveCmdTemplate).
-		Msg("set identity active command template set")
+	v.logger.Debug("set identity active command template set", "template", cfg.SetIdentityActiveCmdTemplate)
 
 	// set identity active command must compile
 	if err := setIdentityActiveCmdTemplate.Execute(&setIdentityActiveCmdBuf, v); err != nil {
@@ -444,9 +460,7 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 
 	// set identity active command
 	v.SetIdentityActiveCommand = setIdentityActiveCmdBuf.String()
-	v.logger.Debug().
-		Str("command", v.SetIdentityActiveCommand).
-		Msg("set identity active command set")
+	v.logger.Debug("set identity active command set", "command", v.SetIdentityActiveCommand)
 
 	// parse passive command template
 	setIdentityPassiveCmdTemplate, err := template.New("set_identity_passive_cmd").
@@ -458,9 +472,7 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 			err,
 		)
 	}
-	v.logger.Debug().
-		Str("template", cfg.SetIdentityPassiveCmdTemplate).
-		Msg("set identity passive command template set")
+	v.logger.Debug("set identity passive command template set", "template", cfg.SetIdentityPassiveCmdTemplate)
 
 	// set identity passive command must compile
 	if err := setIdentityPassiveCmdTemplate.Execute(&setIdentityPassiveCmdBuf, v); err != nil {
@@ -471,14 +483,11 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 		)
 	}
 	v.SetIdentityPassiveCommand = setIdentityPassiveCmdBuf.String()
-	v.logger.Debug().
-		Str("command", v.SetIdentityPassiveCommand).
-		Msg("set identity passive command set")
+	v.logger.Debug("set identity passive command set", "command", v.SetIdentityPassiveCommand)
 
 	// if the commands are the same, warn - could be intentional or a mistake
 	if v.SetIdentityActiveCommand == v.SetIdentityPassiveCommand {
-		log.Warn().
-			Msg("set identity active and passive commands are the same - this could be intentional or a mistake")
+		log.Warn("set identity active and passive commands are the same - this could be intentional or a mistake")
 	}
 
 	return nil
@@ -487,23 +496,23 @@ func (v *Validator) configureSetIdenttiyCommands(cfg FailoverConfig) (err error)
 // configureHooks ensures the hooks are valid and sets them
 func (v *Validator) configureHooks(cfg FailoverConfig) (err error) {
 	v.Hooks = cfg.Hooks
-	v.logger.Debug().
-		Int("pre_when_active", len(v.Hooks.Pre.WhenActive)).
-		Int("pre_when_passive", len(v.Hooks.Pre.WhenPassive)).
-		Int("post_when_active", len(v.Hooks.Post.WhenActive)).
-		Int("post_when_passive", len(v.Hooks.Post.WhenPassive)).
-		Msg("hooks set")
+	v.logger.Debug("hooks set",
+		"pre_when_active", len(v.Hooks.Pre.WhenActive),
+		"pre_when_passive", len(v.Hooks.Pre.WhenPassive),
+		"post_when_active", len(v.Hooks.Post.WhenActive),
+		"post_when_passive", len(v.Hooks.Post.WhenPassive),
+	)
 	for _, h := range v.Hooks.Pre.WhenActive {
-		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  pre hook (when active)")
+		v.logger.Debug("pre hook (when active)", "name", h.Name, "command", h.Command, "args", h.Args, "must_succeed", h.MustSucceed)
 	}
 	for _, h := range v.Hooks.Pre.WhenPassive {
-		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  pre hook (when passive)")
+		v.logger.Debug("pre hook (when passive)", "name", h.Name, "command", h.Command, "args", h.Args, "must_succeed", h.MustSucceed)
 	}
 	for _, h := range v.Hooks.Post.WhenActive {
-		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  post hook (when active)")
+		v.logger.Debug("post hook (when active)", "name", h.Name, "command", h.Command, "args", h.Args, "must_succeed", h.MustSucceed)
 	}
 	for _, h := range v.Hooks.Post.WhenPassive {
-		v.logger.Debug().Str("name", h.Name).Str("command", h.Command).Strs("args", h.Args).Bool("must_succeed", h.MustSucceed).Msg("  post hook (when passive)")
+		v.logger.Debug("post hook (when passive)", "name", h.Name, "command", h.Command, "args", h.Args, "must_succeed", h.MustSucceed)
 	}
 	return nil
 }
@@ -546,11 +555,11 @@ func (v *Validator) configureRollback(cfg FailoverConfig) error {
 		v.Rollback.ToPassive.ResolvedCmd = buf.String()
 	}
 
-	v.logger.Debug().
-		Bool("enabled", v.Rollback.Enabled).
-		Str("to_active_cmd", v.Rollback.ToActive.ResolvedCmd).
-		Str("to_passive_cmd", v.Rollback.ToPassive.ResolvedCmd).
-		Msg("rollback configured")
+	v.logger.Debug("rollback configured",
+		"enabled", v.Rollback.Enabled,
+		"to_active_cmd", v.Rollback.ToActive.ResolvedCmd,
+		"to_passive_cmd", v.Rollback.ToPassive.ResolvedCmd,
+	)
 
 	return nil
 }
@@ -574,10 +583,7 @@ func (v *Validator) configurePeers(cfg PeersConfig) (err error) {
 			Name:    name,
 			Address: peer.Address,
 		}
-		log.Debug().
-			Str("name", name).
-			Str("address", peer.Address).
-			Msg("registered peer")
+		log.Debug("registered peer", "name", name, "address", peer.Address)
 	}
 
 	return nil
@@ -592,9 +598,10 @@ func (v *Validator) GetPublicIP() (string, error) {
 func (v *Validator) configurePublicIP(publicIP string) (err error) {
 	if publicIP != "" {
 		v.PublicIP = publicIP
-		v.logger.Debug().
-			Str("public_ip", v.PublicIP).
-			Msg("public ip set in config - not recommended and actually a dirty hack for testing, likely to break and/or be removed in the future")
+		v.logger.Debug(
+			"public ip set in config - not recommended and actually a dirty hack for testing, likely to break and/or be removed in the future",
+			"public_ip", v.PublicIP,
+		)
 		return nil
 	}
 
@@ -603,9 +610,7 @@ func (v *Validator) configurePublicIP(publicIP string) (err error) {
 		return err
 	}
 
-	v.logger.Debug().
-		Str("public_ip", v.PublicIP).
-		Msg("public ip set")
+	v.logger.Debug("public ip set", "public_ip", v.PublicIP)
 
 	return nil
 }
@@ -621,9 +626,7 @@ func (v *Validator) configureMinimumTimeToLeaderSlot(timeToLeaderSlotDurationStr
 		)
 	}
 	v.MinimumTimeToLeaderSlot = minimumTimeToLeaderSlotDuration
-	v.logger.Debug().
-		Str("minimum_time_to_leader_slot", v.MinimumTimeToLeaderSlot.String()).
-		Msg("minimum time to leader slot set")
+	v.logger.Debug("minimum time to leader slot set", "minimum_time_to_leader_slot", v.MinimumTimeToLeaderSlot.String())
 	return nil
 }
 
@@ -637,7 +640,7 @@ func (v *Validator) GetHostname() (string, error) {
 func (v *Validator) configureHostname(name string) (err error) {
 	if name != "" {
 		v.Hostname = name
-		v.logger.Debug().Str("name", v.Hostname).Msg("name set from config")
+		v.logger.Debug("name set from config", "name", v.Hostname)
 		return nil
 	}
 
@@ -645,7 +648,7 @@ func (v *Validator) configureHostname(name string) (err error) {
 	if err != nil {
 		return err
 	}
-	v.logger.Debug().Str("hostname", v.Hostname).Msg("hostname set from OS")
+	v.logger.Debug("hostname set from OS", "hostname", v.Hostname)
 	return nil
 }
 
@@ -672,11 +675,11 @@ func (v *Validator) configureServer(cfg ServerConfig, monitorCfg MonitorConfig) 
 	monitorCfg.CreditSamples.IntervalDuration = duration
 	v.MonitorConfig = monitorCfg
 
-	v.logger.Debug().
-		Int("port", v.FailoverServerConfig.Port).
-		Int("credit_samples_count", v.MonitorConfig.CreditSamples.Count).
-		Str("credit_samples_interval", v.MonitorConfig.CreditSamples.Interval).
-		Msg("server and monitor config set")
+	v.logger.Debug("server and monitor config set",
+		"port", v.FailoverServerConfig.Port,
+		"credit_samples_count", v.MonitorConfig.CreditSamples.Count,
+		"credit_samples_interval", v.MonitorConfig.CreditSamples.Interval,
+	)
 	return nil
 }
 
@@ -685,7 +688,7 @@ func (v *Validator) configureServer(cfg ServerConfig, monitorCfg MonitorConfig) 
 // to an ephemeral self-signed certificate (encrypted but unauthenticated).
 func (v *Validator) configureTLS(cfg TLSConfig) error {
 	if !cfg.Enabled {
-		v.logger.Debug().Msg("mTLS disabled; QUIC connections use an ephemeral self-signed certificate (encrypted but unauthenticated)")
+		v.logger.Debug("mTLS disabled; QUIC connections use an ephemeral self-signed certificate (encrypted but unauthenticated)")
 		return nil
 	}
 
@@ -725,12 +728,23 @@ func (v *Validator) configureTLS(cfg TLSConfig) error {
 	v.serverTLSConfig = serverTLS
 	v.clientTLSConfig = clientTLS
 
-	v.logger.Info().
-		Str("ca_cert", caCertPath).
-		Str("cert", certPath).
-		Msg("mTLS enabled: certificate and CA loaded successfully")
+	v.logger.Info("mTLS enabled: certificate and CA loaded successfully",
+		"ca_cert", caCertPath,
+		"cert", certPath,
+	)
 
 	return nil
+}
+
+// getLocalNodeVersion returns the solana-core version from the local validator RPC (best-effort).
+// Returns an empty string if the call fails, so callers can treat it as "not available".
+func (v *Validator) getLocalNodeVersion() string {
+	version, err := v.solanaRPCClient.GetLocalNodeVersion()
+	if err != nil {
+		v.logger.Warn("failed to get local node version from RPC - ClientVersionRPC will be empty", "error", err)
+		return ""
+	}
+	return version
 }
 
 // configureGossipNode ensures the gossip node is valid and sets it
@@ -739,25 +753,26 @@ func (v *Validator) configureGossipNode() (err error) {
 	if err != nil {
 		return err
 	}
-	v.logger.Debug().
-		Str("public_ip", v.GossipNode.IP()).
-		Str("pubkey", v.GossipNode.PubKey()).
-		Msg("gossip node set")
+	v.logger.Debug("gossip node set",
+		"public_ip", v.GossipNode.IP(),
+		"pubkey", v.GossipNode.PubKey(),
+	)
 	return nil
 }
 
 // makeActive makes this validator active
 func (v *Validator) makeActive(params FailoverParams) (err error) {
-	log.Debug().Msg("making this validator active")
+	log.Debug("making this validator active")
 
 	if v.IsActive() {
 		return fmt.Errorf("this validator is already active - nothing to do")
 	}
 
-	log.Info().
-		Str("public_ip", v.PublicIP).
-		Str("pubkey", v.Identities.Passive.PubKey()).
-		Msgf("This validator is currently %s", style.RenderPassiveString(strings.ToUpper(constants.NodeRolePassive), false))
+	log.Info(
+		style.RenderPinkString("this validator is currently ")+style.RenderPassiveString(constants.NodeRolePassive, false),
+		"public_ip", v.PublicIP,
+		"pubkey", v.Identities.Passive.PubKey(),
+	)
 
 	// check gossip for active peer and ensure its pubkey is the same as what this node would set itself to
 	_, err = v.solanaRPCClient.NodeFromPubkey(v.Identities.Active.PubKey())
@@ -771,10 +786,10 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 	}
 
 	// delete the tower file if it exists and auto empty when passive is true
-	if v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
-		log.Debug().
-			Str("tower_file", v.TowerFile).
-			Msg("deleting tower file because validator.tower.auto_empty_when_passive is true")
+	if v.Consensus == "tower" && v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
+		log.Debug("deleting tower file because validator.tower.auto_empty_when_passive is true",
+			"tower_file", v.TowerFile,
+		)
 
 		if err = utils.RemoveFile(v.TowerFile); err != nil {
 			return err
@@ -782,10 +797,10 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 	}
 
 	// if the tower file exists and auto empty when passive is false, confirm if you want it deleted and exit if not.
-	if !v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
-		log.Warn().Str("tower_file", v.TowerFile).Msg("tower file exists")
+	if v.Consensus == "tower" && !v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
+		log.Warn("tower file exists", "tower_file", v.TowerFile)
 		if params.AutoConfirm {
-			log.Warn().Str("tower_file", v.TowerFile).Msg("--yes flag set, automatically deleting tower file")
+			log.Warn("--yes flag set, automatically deleting tower file", "tower_file", v.TowerFile)
 		} else {
 			confirmed, err := confirm("Delete tower file and proceed?")
 			if err != nil {
@@ -807,13 +822,14 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		HeartbeatInterval: v.FailoverServerConfig.HeartbeatInterval,
 		StreamTimeout:     v.FailoverServerConfig.StreamTimeout,
 		PassiveNodeInfo: &failover.NodeInfo{
+			Consensus:                      v.Consensus,
 			Hostname:                       v.Hostname,
 			PublicIP:                       v.PublicIP,
 			Identities:                     v.Identities,
 			TowerFile:                      v.TowerFile,
-			VoteHistoryFile:                v.VoteHistoryFile,
 			SetIdentityCommand:             v.SetIdentityActiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
+			ClientVersionRPC:               v.getLocalNodeVersion(),
 			SolanaValidatorFailoverVersion: pkgconstants.AppVersion,
 			RPCAddress:                     v.RPCAddress,
 		},
@@ -849,21 +865,28 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 		return fmt.Errorf("this validator is already passive - nothing to do")
 	}
 
-	log.Info().
-		Str("public_ip", v.PublicIP).
-		Str("pubkey", v.Identities.Active.PubKey()).
-		Msgf("This validator is currently %s", style.RenderActiveString(strings.ToUpper(constants.NodeRoleActive), false))
+	log.Info(
+		style.RenderPinkString("this validator is currently ")+style.RenderActiveString(constants.NodeRoleActive, false),
+		"public_ip", v.PublicIP,
+		"pubkey", v.Identities.Active.PubKey(),
+	)
 
-	log.Debug().Msg("failover active to passive")
+	log.Debug("failover active to passive")
+	consensusState, err := failover.DetectConsensus(v.RPCAddress)
+	if err != nil {
+		return fmt.Errorf("failed to detect consensus for failover handshake: %w", err)
+	}
+	if consensusState.Mode != v.Consensus {
+		return fmt.Errorf("configured consensus %q disagrees with local RPC consensus %q", v.Consensus, consensusState.Mode)
+	}
 
-	// ensure tower file exists and is not empty
-	if !params.SkipTowerFileCheck {
-		if !utils.FileExists(v.TowerFile) {
-			return fmt.Errorf("tower file does not exist: %s", v.TowerFile)
-		}
-		if utils.FileSize(v.TowerFile) == 0 {
-			return fmt.Errorf("tower file is empty: %s", v.TowerFile)
-		}
+	// Ensure the consensus state is available before contacting the passive node.
+	if !utils.FileExists(v.TowerFile) {
+		return fmt.Errorf("%s state file does not exist: %s", v.Consensus, v.TowerFile)
+	}
+
+	if utils.FileSize(v.TowerFile) == 0 {
+		return fmt.Errorf("%s state file is empty: %s", v.Consensus, v.TowerFile)
 	}
 
 	// select passive peer to connect to from declared peers
@@ -882,15 +905,16 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 		RPCURL:                         v.RPCAddress,
 		SkipTowerSync:                  params.SkipTowerSync,
 		ActiveNodeInfo: &failover.NodeInfo{
+			Consensus:                      consensusState.Mode,
+			ConsensusGenesisSlot:           consensusState.GenesisSlot,
 			Hostname:                       v.Hostname,
 			PublicIP:                       v.PublicIP,
 			Identities:                     v.Identities,
 			TowerFile:                      v.TowerFile,
 			TowerFileSizeBytes:             utils.FileSize(v.TowerFile),
-			VoteHistoryFile:                v.VoteHistoryFile,
-			VoteHistoryFileSizeBytes:       utils.FileSize(v.VoteHistoryFile),
 			SetIdentityCommand:             v.SetIdentityPassiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
+			ClientVersionRPC:               v.getLocalNodeVersion(),
 			SolanaValidatorFailoverVersion: pkgconstants.AppVersion,
 			RPCAddress:                     v.RPCAddress,
 		},
@@ -926,12 +950,7 @@ func (v *Validator) waitUntilHealthy() (err error) {
 				continue
 			}
 
-			sp.Title(
-				style.RenderActiveStringf(
-					"validator is healthy and synced - elapsed time %s",
-					time.Since(startTime).String(),
-				),
-			)
+			sp.Title(style.RenderPinkString(fmt.Sprintf("validator is healthy and synced - elapsed time %s", time.Since(startTime).String())))
 			return nil
 		}
 	})
@@ -945,10 +964,7 @@ func (v *Validator) selectPassivePeer(params FailoverParams) (selectedPeer Peer,
 	if params.ToPeer != "" {
 		// match by name first
 		if peer, ok := v.Peers[params.ToPeer]; ok {
-			log.Info().
-				Str("peer", peer.Name).
-				Str("address", peer.Address).
-				Msg("--to-peer: auto-selected peer by name")
+			log.Info("--to-peer: auto-selected peer by name", "peer", peer.Name, "address", peer.Address)
 			return peer, nil
 		}
 		// match by IP (Address is "host:port")
@@ -958,10 +974,7 @@ func (v *Validator) selectPassivePeer(params FailoverParams) (selectedPeer Peer,
 				continue
 			}
 			if host == params.ToPeer {
-				log.Info().
-					Str("peer", peer.Name).
-					Str("address", peer.Address).
-					Msg("--to-peer: auto-selected peer by IP")
+				log.Info("--to-peer: auto-selected peer by IP", "peer", peer.Name, "address", peer.Address)
 				return peer, nil
 			}
 		}
@@ -972,7 +985,7 @@ func (v *Validator) selectPassivePeer(params FailoverParams) (selectedPeer Peer,
 	huhPeerOptions := make([]huh.Option[string], 0)
 	for name, peer := range v.Peers {
 		selectionKey := style.RenderPassiveString(name, false)
-		if zerolog.GlobalLevel() == zerolog.DebugLevel {
+		if log.GetLevel() == log.DebugLevel {
 			selectionKey = fmt.Sprintf(
 				"%s %s",
 				style.RenderPassiveString(name, false),
@@ -994,7 +1007,7 @@ func (v *Validator) selectPassivePeer(params FailoverParams) (selectedPeer Peer,
 		return selectedPeer, fmt.Errorf("failed to select peer: %w", err)
 	}
 
-	log.Debug().Msgf("selected peer: %s address: %s", selectedPeerName, v.Peers[selectedPeerName].Address)
+	log.Debugf("selected peer: %s address: %s", selectedPeerName, v.Peers[selectedPeerName].Address)
 
 	return v.Peers[selectedPeerName], nil
 }

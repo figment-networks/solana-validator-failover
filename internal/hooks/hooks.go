@@ -10,7 +10,7 @@ import (
 	"text/template"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rs/zerolog/log"
+	"github.com/charmbracelet/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/utils"
 )
 
@@ -99,6 +99,7 @@ type HookTemplateData struct {
 	ThisNodePassiveIdentityPubkey  string
 	ThisNodePassiveIdentityKeyFile string
 	ThisNodeClientVersion          string
+	ThisNodeClientVersionLocalRPC  string
 	ThisNodeRPCAddress             string
 
 	// Peer node info
@@ -107,6 +108,7 @@ type HookTemplateData struct {
 	PeerNodeActiveIdentityPubkey  string
 	PeerNodePassiveIdentityPubkey string
 	PeerNodeClientVersion         string
+	PeerNodeClientVersionLocalRPC string
 }
 
 // newHookTemplateData creates a HookTemplateData from an envMap
@@ -130,6 +132,7 @@ func newHookTemplateData(envMap map[string]string) HookTemplateData {
 	data.ThisNodePassiveIdentityPubkey = envMap["THIS_NODE_PASSIVE_IDENTITY_PUBKEY"]
 	data.ThisNodePassiveIdentityKeyFile = envMap["THIS_NODE_PASSIVE_IDENTITY_KEYPAIR_FILE"]
 	data.ThisNodeClientVersion = envMap["THIS_NODE_CLIENT_VERSION"]
+	data.ThisNodeClientVersionLocalRPC = envMap["THIS_NODE_CLIENT_VERSION_LOCAL_RPC"]
 	data.ThisNodeRPCAddress = envMap["THIS_NODE_RPC_ADDRESS"]
 
 	// Parse peer node info
@@ -138,6 +141,7 @@ func newHookTemplateData(envMap map[string]string) HookTemplateData {
 	data.PeerNodeActiveIdentityPubkey = envMap["PEER_NODE_ACTIVE_IDENTITY_PUBKEY"]
 	data.PeerNodePassiveIdentityPubkey = envMap["PEER_NODE_PASSIVE_IDENTITY_PUBKEY"]
 	data.PeerNodeClientVersion = envMap["PEER_NODE_CLIENT_VERSION"]
+	data.PeerNodeClientVersionLocalRPC = envMap["PEER_NODE_CLIENT_VERSION_LOCAL_RPC"]
 
 	return data
 }
@@ -191,7 +195,7 @@ func RenderHookCommand(hook Hook, templateData HookTemplateData) (string, error)
 
 // Run runs the hook
 func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, totalHooks int) error {
-	hookLogger := log.With().Logger()
+	hookLogger := log.WithPrefix("hooks")
 
 	// Create template data from envMap
 	templateData := newHookTemplateData(envMap)
@@ -246,13 +250,13 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", strings.ToUpper(envKey), envValue))
 	}
 
-	hookLogger.Debug().
-		Str("command_template", h.Command).
-		Str("command_executed", command).
-		Str("args_template", fmt.Sprintf("[%s]", strings.Join(h.Args, ", "))).
-		Str("args_executed", fmt.Sprintf("[%s]", strings.Join(args, ", "))).
-		Str("env", fmt.Sprintf("[%s]", strings.Join(cmd.Env, ", "))).
-		Msg("running hook")
+	hookLogger.Debug("running hook",
+		"command_template", h.Command,
+		"command_executed", command,
+		"args_template", fmt.Sprintf("[%s]", strings.Join(h.Args, ", ")),
+		"args_executed", fmt.Sprintf("[%s]", strings.Join(args, ", ")),
+		"env", fmt.Sprintf("[%s]", strings.Join(cmd.Env, ", ")),
+	)
 
 	// Capture stdout and stderr separately
 	stdout, err := cmd.StdoutPipe()
@@ -264,24 +268,22 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 		return fmt.Errorf("Hook %s failed to create stderr pipe: %v", h.Name, err)
 	}
 
-	// Start the command
-	hookLogger.Debug().
-		Str("command", command).
-		Str("args", fmt.Sprintf("[%s]", strings.Join(args, ", "))).
-		Msgf("Running hook %s", h.Name)
+	hookLogger.Debug("running hook", "command", command, "args", fmt.Sprintf("[%s]", strings.Join(args, ", ")), "name", h.Name)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("Hook %s failed to start: %v", h.Name, err)
 	}
 
 	// get the command pid (only after successful start)
 	pid := cmd.Process.Pid
-	hookLogger.Debug().Int("pid", pid).Msg("hook process started")
+	hookLogger.Debug("hook process started", "pid", pid)
 
 	// Use WaitGroup to ensure goroutines complete before we return
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Stream stdout and stderr in real-time using hookLogger
+	// Stream stdout and stderr in real-time.
+	// Use the base logger (no prefix) since styledStreamOutputString already
+	// embeds the full "hooks:<type>:[N/N name]:" prefix in the message.
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdout)
@@ -289,7 +291,7 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
 				styledOutput := styledStreamOutputString("stdout", line, h.Name, hookType, hookIndex, totalHooks)
-				hookLogger.Info().Msg(styledOutput)
+				log.Info(styledOutput)
 			}
 		}
 	}()
@@ -301,7 +303,7 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
 				styledOutput := styledStreamOutputString("stderr", line, h.Name, hookType, hookIndex, totalHooks)
-				hookLogger.Info().Msg(styledOutput)
+				log.Info(styledOutput)
 			}
 		}
 	}()
@@ -316,7 +318,7 @@ func (h Hook) Run(envMap map[string]string, hookType string, hookIndex int, tota
 		return fmt.Errorf("Hook %s failed: %v", h.Name, err)
 	}
 
-	hookLogger.Debug().Msgf("Hook %s completed successfully", h.Name)
+	hookLogger.Debugf("Hook %s completed successfully", h.Name)
 	return nil
 }
 
@@ -354,7 +356,7 @@ func (h FailoverHooks) RunPreWhenPassive(envMap map[string]string) error {
 			return err
 		}
 		if err != nil {
-			log.Error().Err(err).Msgf("pre hook %s failed - must_succeed is false, continuing...", hook.Name)
+			log.Error("pre hook failed - must_succeed is false, continuing...", "hook", hook.Name, "err", err)
 		}
 	}
 	return nil
@@ -368,7 +370,7 @@ func (h FailoverHooks) RunPreWhenActive(envMap map[string]string) error {
 			return err
 		}
 		if err != nil {
-			log.Error().Err(err).Msgf("pre hook %s failed - must_succeed is false, continuing...", hook.Name)
+			log.Error("pre hook failed - must_succeed is false, continuing...", "hook", hook.Name, "err", err)
 			continue
 		}
 	}
@@ -380,7 +382,7 @@ func (h FailoverHooks) RunPostWhenPassive(envMap map[string]string) {
 	for i, hook := range h.Post.WhenPassive {
 		err := hook.Run(envMap, "post", i+1, len(h.Post.WhenPassive))
 		if err != nil {
-			log.Error().Err(err).Msgf("post hook %s failed", hook.Name)
+			log.Error("post hook failed", "hook", hook.Name, "err", err)
 		}
 	}
 }
@@ -390,7 +392,7 @@ func (h FailoverHooks) RunPostWhenActive(envMap map[string]string) {
 	for i, hook := range h.Post.WhenActive {
 		err := hook.Run(envMap, "post", i+1, len(h.Post.WhenActive))
 		if err != nil {
-			log.Error().Err(err).Msgf("post hook %s failed", hook.Name)
+			log.Error("post hook failed", "hook", hook.Name, "err", err)
 		}
 	}
 }

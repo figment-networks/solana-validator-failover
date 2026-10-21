@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simple p2p Solana validator failovers. This tool helps automate _planned_ failovers. To automate _unexpected_ failovers, see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
+Simple p2p Solana validator failovers. This tool helps automate **planned** failovers. To automate **unexpected** failovers see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
 
 ![solana-validator-failover](docs/failover.png)
 
-A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://blog.solstrategies.io/quic-solana-validator-failovers-738d712ac737) covers the background in more detail. In summary, it coordinates three steps across both nodes:
+A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://solstrategies.io/blog/quic-solana-validator-failovers) covers the background in more detail. In summary, it coordinates three steps across both nodes:
 
 1. Active validator sets identity to passive
 2. Tower file synced from active to passive validator
@@ -44,11 +44,13 @@ solana-validator-failover run --not-a-drill
 solana-validator-failover run
 ```
 
-By default, `run` executes in **dry-run mode**: the tower file is synced and all timings are recorded, but set-identity commands are not executed. This is useful for gauging failover speed under real network conditions without committing. Pass `--not-a-drill` on the **passive** node to execute for real.
+By default, `run` executes in **dry-run mode**: the consensus state file is synced and all timings are recorded, but set-identity commands are not executed. This is useful for gauging failover speed under real network conditions without committing. Pass `--not-a-drill` on the **passive** node to execute for real.
+
+Set `validator.failover.consensus.mode` on both nodes to `tower` or `alpenglow`. The default is `tower`. At startup, the configured mode is checked against the validator's local RPC; a mismatch, migration, or unknown state prevents startup. The handshake checks both nodes again and requires the same Alpenglow genesis slot. For Alpenglow, remove `--require-tower` from any explicitly configured identity command. Vote history is read from each node's `validator.ledger_dir`; no separate directory setting is needed. Upgrade both failover binaries together before running failover.
 
 > ⚠️ **Who you run this as matters.** The user must have:
 > - Permission to run set-identity commands for the validator
-> - Read/write permission on the tower file — verify inherited permissions after a dry-run
+> - Read/write permission on the tower or vote-history file — verify inherited permissions after a dry-run
 
 ### Flags
 
@@ -59,7 +61,7 @@ By default, `run` executes in **dry-run mode**: the tower file is synced and all
 | `--not-a-drill`                | `false` | Execute failover for real. Effective on the passive node; ignored on the active node.                                                                             |
 | `--no-wait-for-healthy`        | `false` | Skip waiting for the node to report healthy at `<rpc_address>/health`.                                                                                            |
 | `--no-min-time-to-leader-slot` | `false` | Skip waiting for the active node to have no leader slots in the next `min_time_to_leader_slot` window. Effective on the active node; ignored on the passive node. |
-| `--skip-tower-sync`            | `false` | Skip syncing the tower file from active to passive. The passive node must not have an existing tower file.                                                        |
+| `--skip-tower-sync`            | `false` | Skip syncing the tower file in Tower mode. Unavailable in Alpenglow mode.                                                                                           |
 | `-y, --yes`                    | `false` | Skip all interactive confirmation prompts.                                                                                                                        |
 | `--to-peer <name\|ip>`         | —       | When run on the active node, auto-select a peer by its configured name or IP address, skipping the interactive selector. Ignored on the passive node.             |
 
@@ -68,7 +70,8 @@ By default, `run` executes in **dry-run mode**: the tower file is synced and all
 | Flag                      | Default                                                      | Description                                   |
 | ------------------------- | ------------------------------------------------------------ | --------------------------------------------- |
 | `-c, --config <path>`     | `~/solana-validator-failover/solana-validator-failover.yaml` | Path to config file.                          |
-| `-l, --log-level <level>` | `info`                                                       | Log level (`debug`, `info`, `warn`, `error`). |
+| `-l, --log-level <level>` | —                                                            | Override `log.level` (`debug`, `info`, `warn`, `error`, `fatal`). |
+| `-n, --no-update-check`   | `false`                                                      | Skip the startup update check. Overrides `update.check_on_startup` in the config file. |
 
 ### Peer selection
 
@@ -114,12 +117,21 @@ Download and install the latest [release](https://github.com/SOL-Strategies/sola
 
 2. **Some focus and appreciation of what you're doing** — these can be high pucker factor operations regardless of tooling.
 
-3. **Local validator started with `--full-rpc-api`** — this tool calls `getClusterNodes` on the local RPC, which requires the validator to be started with the `--full-rpc-api` flag (Agave/Firedancer).
+3. **Local RPC supports account reads and gossip discovery** — startup calls local `getAccountInfo` to validate consensus in both Tower and Alpenglow modes, and peer discovery calls `getClusterNodes`. For Agave/Jito, start the validator with `--full-rpc-api`. For Frankendancer (`fdctl`), set `full_api = true` under `[rpc]` in its TOML configuration. Native Firedancer uses `[tiles.rpc]`; verify that the configured endpoint and validator version support the required methods rather than applying Agave's flag. Alpenglow mode additionally requires `getAgGenesisCert`. For resilient peer discovery, configure a private cluster RPC that also supports `getClusterNodes`; gossip discovery falls back to it, but local consensus validation cannot.
 
 ## Configuration
 
 ```yaml
 # default --config=~/solana-validator-failover/solana-validator-failover.yaml
+log:
+  # minimum log level; overridden by --log-level when explicitly supplied
+  # default: info; one of: debug, info, warn, error, fatal
+  level: info
+
+  # log output format
+  # default: text; one of: text, logfmt, json
+  format: text
+
 validator:
   # path of validator program to use when issuing set-identity commands
   # default: agave-validator
@@ -130,9 +142,10 @@ validator:
   #            any other value is treated as a custom cluster (requires cluster_rpc_url)
   cluster: mainnet-beta
 
-  # (required for custom clusters) RPC URL for the cluster - must support getClusterNodes.
-  # For well-known clusters the built-in URL is used. For custom clusters, or if you need
-  # to override the default (e.g. to use a private RPC), set this explicitly.
+  # (required for custom clusters) RPC URL for the cluster.
+  # For well-known clusters the built-in URL is used unless this is set. A private endpoint
+  # that supports getClusterNodes is recommended: peer discovery falls back to it when the
+  # local validator's gossip view does not contain the expected peer.
   # cluster_rpc_url: <solana_compatible_rpc_endpoint>
 
   # optional display name used in failover plans, logs, and hook templates
@@ -163,10 +176,11 @@ validator:
 
   # local rpc address of node this program runs on
   # default: http://localhost:8899
-  # note: the validator must be started with --full-rpc-api (required for getClusterNodes)
+  # requires getAccountInfo and getClusterNodes (Agave/Jito: --full-rpc-api;
+  # Frankendancer: [rpc] full_api = true). Alpenglow also requires getAgGenesisCert.
   rpc_address: http://localhost:8899
 
-  # tower file config
+  # tower file config (required only when failover.consensus.mode is tower)
   tower:
     # (required) directory hosting the tower file
     dir: /mnt/accounts/tower
@@ -182,6 +196,11 @@ validator:
 
   # failover configuration
   failover:
+    # tower (default) or alpenglow; configure identically on both nodes.
+    # Alpenglow transfers vote_history-<active identity>.bin from validator.ledger_dir.
+    # The mode must agree with the local validator's on-chain genesis certificate.
+    consensus:
+      mode: tower
     # failover server config (runs on passive node taking over from active node)
     server:
       # default: 9898 - QUIC (udp) port to listen on
@@ -224,7 +243,8 @@ validator:
     # {{ .Identities }} - an object that has Active/Passive properties referencing
     #                     the loaded identities from validator.identities
     # {{ .LedgerDir }}  - a resolved absolute path to validator.ledger_dir
-    # defaults shown below
+    # Tower default shown below. In Alpenglow mode the default omits --require-tower.
+    # Remove --require-tower from an explicit active command when switching modes.
     set_identity_active_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Active.KeyFile }} --require-tower"
     set_identity_passive_cmd_template: "{{ .Bin }} --ledger {{ .LedgerDir }} set-identity {{ .Identities.Passive.KeyFile }}"
 
@@ -273,6 +293,7 @@ validator:
     # {{ .ThisNodePassiveIdentityPubkey }}       - string: pubkey this node uses when passive
     # {{ .ThisNodePassiveIdentityKeyFile }}      - string: path to keyfile from validator.identities.passive
     # {{ .ThisNodeClientVersion }}               - string: gossip-reported solana validator client semantic version for this node
+    # {{ .ThisNodeClientVersionLocalRPC }}       - string: solana-core version from local validator getVersion RPC for this node (may differ from gossip for jito-solana/firedancer; empty if unavailable)
     # {{ .ThisNodeRPCAddress }}                  - string: local validator RPC URL from config (validator.rpc_address)
     # {{ .PeerNodeRole }}                        - string: "active" or "passive"
     # {{ .PeerNodeName }}                        - string: hostname of peer node
@@ -280,6 +301,7 @@ validator:
     # {{ .PeerNodeActiveIdentityPubkey }}        - string: pubkey peer uses when active
     # {{ .PeerNodePassiveIdentityPubkey }}       - string: pubkey peer uses when passive
     # {{ .PeerNodeClientVersion }}               - string: gossip-reported solana validator client semantic version for peer node
+    # {{ .PeerNodeClientVersionLocalRPC }}       - string: solana-core version from local validator getVersion RPC for peer node (may differ from gossip for jito-solana/firedancer; empty if unavailable)
     #
     # Standard environment variables passed to hook commands (SOLANA_VALIDATOR_FAILOVER_*):
     # ------------------------------------------------------------------------------------------------------------
@@ -292,6 +314,7 @@ validator:
     # SOLANA_VALIDATOR_FAILOVER_THIS_NODE_PASSIVE_IDENTITY_PUBKEY       = pubkey this node uses when passive
     # SOLANA_VALIDATOR_FAILOVER_THIS_NODE_PASSIVE_IDENTITY_KEYPAIR_FILE = path to keyfile from validator.identities.passive
     # SOLANA_VALIDATOR_FAILOVER_THIS_NODE_CLIENT_VERSION                = gossip-reported solana validator client semantic version for this node
+    # SOLANA_VALIDATOR_FAILOVER_THIS_NODE_CLIENT_VERSION_LOCAL_RPC     = solana-core version from local validator getVersion RPC for this node (may differ from gossip for jito-solana/firedancer; empty if unavailable)
     # SOLANA_VALIDATOR_FAILOVER_THIS_NODE_RPC_ADDRESS                   = local validator RPC URL from config (validator.rpc_address)
     # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_ROLE                          = "active|passive"
     # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_NAME                          = hostname of peer
@@ -299,6 +322,7 @@ validator:
     # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_ACTIVE_IDENTITY_PUBKEY        = pubkey peer uses when active
     # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_PASSIVE_IDENTITY_PUBKEY       = pubkey peer uses when passive
     # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_CLIENT_VERSION                = gossip-reported solana validator client semantic version for peer node
+    # SOLANA_VALIDATOR_FAILOVER_PEER_NODE_CLIENT_VERSION_LOCAL_RPC     = solana-core version from local validator getVersion RPC for peer node (may differ from gossip for jito-solana/firedancer; empty if unavailable)
     hooks:
       # hooks to run before failover - errors in pre hooks optionally abort failover
       pre:
@@ -383,6 +407,13 @@ validator:
             - name: notify-rollback-to-passive
               command: ./scripts/notify_rollback.sh
               args: ["to-passive"]
+
+# update check configuration
+update:
+  # check for a new release on startup and print a warning if one is available
+  # default: true
+  # override with the --no-update-check CLI flag
+  check_on_startup: true
 ```
 
 ## Rollback
@@ -395,10 +426,10 @@ Rollback is only triggered by an **explicit signal** from the passive node. Spec
 
 ### What it does
 
-| Node                                             | Rollback action                                                                   |
-| ------------------------------------------------ | --------------------------------------------------------------------------------- |
-| Active node (was active, became passive)         | Runs `set-identity-to-active` command → `rollback.to_active` post-hooks           |
-| Passive node (tried and failed to become active) | Runs `set-identity-to-passive` command → `rollback.to_passive` post-hooks         |
+| Node                                             | Rollback action                                                           |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| Active node (was active, became passive)         | Runs `set-identity-to-active` command → `rollback.to_active` post-hooks   |
+| Passive node (tried and failed to become active) | Runs `set-identity-to-passive` command → `rollback.to_passive` post-hooks |
 
 Post-hooks always run even if the set-identity command fails. Pre hooks are intentionally not supported for rollback: a pre hook with `must_succeed: true` could block the rollback set-identity command from running, which would defeat the purpose of rollback.
 
@@ -413,6 +444,32 @@ Post-hooks always run even if the set-identity command fails. Pre hooks are inte
 ### Rollback is shown in the failover plan
 
 When `rollback.enabled: true`, the pre-failover plan shows the rollback commands that would run on each node if the failover fails, giving operators visibility before they confirm.
+
+## Troubleshooting local RPC capabilities
+
+If startup reports `local RPC method getAccountInfo is unavailable` with JSON-RPC code `-32601`, enable full RPC on the local validator: `--full-rpc-api` for Agave/Jito, or `full_api = true` under `[rpc]` for Frankendancer (`fdctl`). Restart the validator with the updated configuration before retrying failover. This check runs in Tower mode too; it reads local accounts to verify the configured consensus mode. A cluster RPC URL cannot replace this local check.
+
+For native Firedancer, verify its `[tiles.rpc]` endpoint and method support for the installed version. If using a proxy, ensure it routes and permits the required methods. An unavailable method does not establish that a particular startup flag is missing. If `getAgGenesisCert` is unavailable, also verify that the validator version supports that Alpenglow RPC method.
+
+The tool reports these failures through its existing RPC calls, without additional startup probes. Connection, authentication, and other RPC errors retain their original diagnostics. Missing account data is handled by consensus detection and is not treated as a missing method.
+
+## Troubleshooting gossip peer discovery
+
+`svf` determines this node's role from the local validator RPC. When looking for the active peer by pubkey, it checks the local RPC first and then `validator.cluster_rpc_url`. This matters because `getClusterNodes` represents the responding validator's own in-memory gossip/CRDS view; it can differ from the independent view collected by `solana gossip`, especially in mixed-client Agave/Firedancer deployments.
+
+To inspect exactly what the local RPC reports:
+
+```shell
+PK=<active_identity_pubkey>
+RPC=http://127.0.0.1:8899
+
+curl -sS "$RPC" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getClusterNodes"}' |
+  jq --arg pk "$PK" '{error, count:(.result | length), match:[.result[] | select(.pubkey == $pk)]}'
+```
+
+If `match` is empty locally while `solana gossip` shows the peer, configure a trusted private `cluster_rpc_url` that exposes `getClusterNodes`. `svf` still fails closed if neither RPC view contains the expected active pubkey.
 
 ## Developing
 

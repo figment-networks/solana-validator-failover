@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
+	"github.com/charmbracelet/log"
 	"github.com/quic-go/quic-go"
-	"github.com/rs/zerolog/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
 	"github.com/sol-strategies/solana-validator-failover/internal/style"
@@ -44,7 +45,7 @@ func NewFailoverStream(stream *quic.Stream) *Stream {
 func (s *Stream) Encode() error {
 	err := s.encoder.Encode(s.message)
 	if err != nil {
-		log.Err(err).Msg("failed to encode failover message")
+		log.Error("failed to encode failover message", "err", err)
 		return err
 	}
 	return nil
@@ -54,7 +55,7 @@ func (s *Stream) Encode() error {
 func (s *Stream) Decode() error {
 	err := s.decoder.Decode(&s.message)
 	if err != nil {
-		log.Err(err).Msg("failed to decode failover message")
+		log.Error("failed to decode failover message", "err", err)
 		return err
 	}
 	return nil
@@ -87,7 +88,7 @@ func (s *Stream) SetErrorMessagef(format string, a ...any) {
 
 // LogErrorWithSetMessagef logs an error with a formatted string and sets the error message
 func (s *Stream) LogErrorWithSetMessagef(format string, a ...any) {
-	log.Error().Msgf(format, a...)
+	log.Errorf(format, a...)
 	s.SetErrorMessagef(format, a...)
 }
 
@@ -204,6 +205,7 @@ func (s *Stream) buildHookTemplateDataForActiveNode(isPreFailover bool, rpcURL s
 	data.ThisNodePassiveIdentityPubkey = s.message.ActiveNodeInfo.Identities.Passive.PubKey()
 	data.ThisNodePassiveIdentityKeyFile = s.message.ActiveNodeInfo.Identities.Passive.KeyFile
 	data.ThisNodeClientVersion = s.message.ActiveNodeInfo.ClientVersion
+	data.ThisNodeClientVersionLocalRPC = s.message.ActiveNodeInfo.ClientVersionRPC
 	data.ThisNodeRPCAddress = rpcURL
 
 	// Peer node (passive)
@@ -212,6 +214,7 @@ func (s *Stream) buildHookTemplateDataForActiveNode(isPreFailover bool, rpcURL s
 	data.PeerNodeActiveIdentityPubkey = s.message.PassiveNodeInfo.Identities.Active.PubKey()
 	data.PeerNodePassiveIdentityPubkey = s.message.PassiveNodeInfo.Identities.Passive.PubKey()
 	data.PeerNodeClientVersion = s.message.PassiveNodeInfo.ClientVersion
+	data.PeerNodeClientVersionLocalRPC = s.message.PassiveNodeInfo.ClientVersionRPC
 
 	return data
 }
@@ -238,6 +241,7 @@ func (s *Stream) buildHookTemplateDataForPassiveNode(isPreFailover bool, rpcURL 
 	data.ThisNodePassiveIdentityPubkey = s.message.PassiveNodeInfo.Identities.Passive.PubKey()
 	data.ThisNodePassiveIdentityKeyFile = s.message.PassiveNodeInfo.Identities.Passive.KeyFile
 	data.ThisNodeClientVersion = s.message.PassiveNodeInfo.ClientVersion
+	data.ThisNodeClientVersionLocalRPC = s.message.PassiveNodeInfo.ClientVersionRPC
 	data.ThisNodeRPCAddress = rpcURL
 
 	// Peer node (active)
@@ -246,6 +250,7 @@ func (s *Stream) buildHookTemplateDataForPassiveNode(isPreFailover bool, rpcURL 
 	data.PeerNodeActiveIdentityPubkey = s.message.ActiveNodeInfo.Identities.Active.PubKey()
 	data.PeerNodePassiveIdentityPubkey = s.message.ActiveNodeInfo.Identities.Passive.PubKey()
 	data.PeerNodeClientVersion = s.message.ActiveNodeInfo.ClientVersion
+	data.PeerNodeClientVersionLocalRPC = s.message.ActiveNodeInfo.ClientVersionRPC
 
 	return data
 }
@@ -274,11 +279,11 @@ func (s *Stream) ConfirmFailover(failoverHooks hooks.FailoverHooks, rollback hoo
 		return err
 	}
 
-	fmt.Print(style.RenderMessageString(strings.Trim(rendered, "\n")))
+	fmt.Print(style.RenderMessageString(strings.TrimLeft(rendered, "\n")))
 	fmt.Println()
 
 	if autoConfirm {
-		log.Warn().Msg("--yes flag set, automatically proceeding with failover")
+		log.Warn("--yes flag set, automatically proceeding with failover")
 		return nil
 	}
 
@@ -317,6 +322,10 @@ func (s *Stream) GetFailoverSlotsDuration() uint64 {
 // BuildSummaryData builds a SummaryData from the current stream message state.
 // Call this after the failover is complete and all timing fields are set.
 func (s *Stream) BuildSummaryData() SummaryData {
+	stateFileSize := int64(len(s.message.ActiveNodeInfo.TowerFileBytes))
+	if s.message.ActiveNodeInfo.Consensus == "alpenglow" {
+		stateFileSize = s.message.ActiveNodeInfo.TowerFileSizeBytes
+	}
 	return SummaryData{
 		IsDryRun:      s.message.IsDryRunFailover,
 		SkipTowerSync: s.message.SkipTowerSync,
@@ -326,7 +335,7 @@ func (s *Stream) BuildSummaryData() SummaryData {
 
 		OrigActiveSetIdentityDuration:  s.message.ActiveNodeSetIdentityEndTime.Sub(s.message.ActiveNodeSetIdentityStartTime),
 		TowerSyncDuration:              s.message.PassiveNodeSyncTowerFileEndTime.Sub(s.message.ActiveNodeSyncTowerFileStartTime),
-		TowerFileSizeBytes:             int64(len(s.message.ActiveNodeInfo.TowerFileBytes)),
+		TowerFileSizeBytes:             stateFileSize,
 		OrigPassiveSetIdentityDuration: s.message.PassiveNodeSetIdentityEndTime.Sub(s.message.PassiveNodeSetIdentityStartTime),
 		TotalDuration:                  s.GetFailoverDuration(),
 
@@ -394,14 +403,18 @@ func (s *Stream) PullActiveIdentityVoteCreditsSample(solanaRPCClient solana.Clie
 
 	// find compute credits
 	if len(voteAccount.EpochCredits) > 0 {
-		// Calculate credits as the difference between current and previous epoch credits
+		// Calculate credits as the difference between current and previous epoch credits.
+		// Alpenglow vote accounts can carry math.MaxUint64 sentinels; treat those (and
+		// any underflow) as 0 rather than overflowing the sample.
 		lastIndex := len(voteAccount.EpochCredits) - 1
 		currentCredits := voteAccount.EpochCredits[lastIndex][1]
-		previousCredits := int64(0)
+		previousCredits := uint64(0)
 		if lastIndex > 0 {
 			previousCredits = voteAccount.EpochCredits[lastIndex-1][1]
 		}
-		sample.Credits = int(currentCredits - previousCredits)
+		if currentCredits != math.MaxUint64 && previousCredits != math.MaxUint64 && currentCredits >= previousCredits {
+			sample.Credits = int(currentCredits - previousCredits)
+		}
 	}
 
 	// append sample to the identity's credit samples
@@ -424,16 +437,16 @@ func (s *Stream) PullActiveIdentityVoteCreditsSamples(solanaRPCClient solana.Cli
 
 	// multiple samples may take some time so show a spinner to keep you patient
 	var sp *spinner.Spinner
-	sp = spinner.New().Title(fmt.Sprintf("Pulling %d vote credit samples %s apart...", nSamples, interval))
+	sp = spinner.New().Title(style.RenderPinkString(fmt.Sprintf("pulling %d vote credit samples %s apart...", nSamples, interval)))
 
 	sampleCount := 0
 	sp.ActionWithErr(func(ctx context.Context) error {
 		for range make([]struct{}, nSamples) {
 			sampleCount++
-			sp.Title(fmt.Sprintf("Pulling vote credit sample %d of %d...", sampleCount, nSamples))
+			sp.Title(style.RenderPinkString(fmt.Sprintf("pulling vote credit sample %d of %d...", sampleCount, nSamples)))
 			err := s.PullActiveIdentityVoteCreditsSample(solanaRPCClient)
 			if err != nil {
-				sp.Title(fmt.Sprintf("Failed to pull vote credits sample: %s", err))
+				sp.Title(style.RenderErrorStringf("failed to pull vote credits sample: %s", err))
 				continue
 			}
 			sample := s.message.CreditSamples[s.message.ActiveNodeInfo.Identities.Active.PubKey()][len(s.message.CreditSamples[s.message.ActiveNodeInfo.Identities.Active.PubKey()])-1]
@@ -442,16 +455,16 @@ func (s *Stream) PullActiveIdentityVoteCreditsSamples(solanaRPCClient solana.Cli
 				previousSample := s.message.CreditSamples[s.message.ActiveNodeInfo.Identities.Active.PubKey()][len(s.message.CreditSamples[s.message.ActiveNodeInfo.Identities.Active.PubKey()])-2]
 				if sample.Credits <= previousSample.Credits {
 					sp.Title(style.RenderWarningStringf(
-						"Vote credits are not increasing between samples %d and %d - this is not good",
+						"vote credits are not increasing between samples %d and %d - this is not good",
 						sampleCount-1,
 						sampleCount,
 					))
 				}
 			}
 			time.Sleep(interval)
-			sp.Title(fmt.Sprintf("Pulled vote credit sample %d of %d - credits: %d, rank: %d...", sampleCount, nSamples, sample.Credits, sample.VoteRank))
+			sp.Title(style.RenderPinkString(fmt.Sprintf("pulled vote credit sample %d of %d - credits: %d, rank: %d...", sampleCount, nSamples, sample.Credits, sample.VoteRank)))
 		}
-		log.Debug().Msgf("Pulled %d vote credit samples", sampleCount)
+		log.Debugf("Pulled %d vote credit samples", sampleCount)
 		return nil
 	})
 	return sp.Run()
