@@ -34,18 +34,19 @@ type CreditSamplesConfig struct {
 
 // ServerConfig is the configuration for the failover server
 type ServerConfig struct {
-	Port              int
-	HeartbeatInterval string
-	StreamTimeout     string
-	PassiveNodeInfo   *NodeInfo
-	SolanaRPCClient   solana.ClientInterface
-	RPCURL            string
-	IsDryRunFailover  bool
-	Hooks             hooks.FailoverHooks
-	MonitorConfig     MonitorConfig
-	SkipTowerSync     bool
-	AutoConfirm       bool
-	Rollback          hooks.RollbackConfig
+	Port                 int
+	HeartbeatInterval    string
+	StreamTimeout        string
+	PassiveNodeInfo      *NodeInfo
+	SolanaRPCClient      solana.ClientInterface
+	RPCURL               string
+	IsDryRunFailover     bool
+	Hooks                hooks.FailoverHooks
+	MonitorConfig        MonitorConfig
+	SkipTowerSync        bool
+	SkipVoteCreditsCheck bool
+	AutoConfirm          bool
+	Rollback             hooks.RollbackConfig
 	// TLSConfig is an optional mTLS config. When non-nil, the server requires
 	// connecting clients to present a certificate signed by the configured CA.
 	// When nil, an ephemeral self-signed certificate is used (no client auth).
@@ -54,28 +55,29 @@ type ServerConfig struct {
 
 // Server is the failover server - run by the passive node
 type Server struct {
-	port              int
-	listenAddr        string
-	tlsConfig         *tls.Config
-	transport         *quic.Transport
-	listener          *quic.Listener
-	heartbeatInterval time.Duration
-	streamTimeout     time.Duration
-	ctx               context.Context
-	cancel            context.CancelFunc
-	logger            *log.Logger
-	passiveNodeInfo   *NodeInfo
-	solanaRPCClient   solana.ClientInterface
-	rpcURL            string
-	failoverStream    *Stream
-	isDryRunFailover  bool
-	activeConn        *quic.Conn
-	hooks             hooks.FailoverHooks
-	monitorConfig     MonitorConfig
-	skipTowerSync     bool
-	autoConfirm       bool
-	rollback          hooks.RollbackConfig
-	mtlsEnabled       bool
+	port                 int
+	listenAddr           string
+	tlsConfig            *tls.Config
+	transport            *quic.Transport
+	listener             *quic.Listener
+	heartbeatInterval    time.Duration
+	streamTimeout        time.Duration
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	logger               *log.Logger
+	passiveNodeInfo      *NodeInfo
+	solanaRPCClient      solana.ClientInterface
+	rpcURL               string
+	failoverStream       *Stream
+	isDryRunFailover     bool
+	activeConn           *quic.Conn
+	hooks                hooks.FailoverHooks
+	monitorConfig        MonitorConfig
+	skipTowerSync        bool
+	skipVoteCreditsCheck bool
+	autoConfirm          bool
+	rollback             hooks.RollbackConfig
+	mtlsEnabled          bool
 }
 
 // NewServerFromConfig creates a new failover server from a configuration
@@ -100,21 +102,22 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		port:             config.Port,
-		tlsConfig:        serverTLSConfig,
-		mtlsEnabled:      mtlsEnabled,
-		logger:           log.Default(),
-		ctx:              ctx,
-		cancel:           cancel,
-		passiveNodeInfo:  config.PassiveNodeInfo,
-		solanaRPCClient:  config.SolanaRPCClient,
-		rpcURL:           config.RPCURL,
-		isDryRunFailover: config.IsDryRunFailover,
-		hooks:            config.Hooks,
-		monitorConfig:    config.MonitorConfig,
-		skipTowerSync:    config.SkipTowerSync,
-		autoConfirm:      config.AutoConfirm,
-		rollback:         config.Rollback,
+		port:                 config.Port,
+		tlsConfig:            serverTLSConfig,
+		mtlsEnabled:          mtlsEnabled,
+		logger:               log.Default(),
+		ctx:                  ctx,
+		cancel:               cancel,
+		passiveNodeInfo:      config.PassiveNodeInfo,
+		solanaRPCClient:      config.SolanaRPCClient,
+		rpcURL:               config.RPCURL,
+		isDryRunFailover:     config.IsDryRunFailover,
+		hooks:                config.Hooks,
+		monitorConfig:        config.MonitorConfig,
+		skipTowerSync:        config.SkipTowerSync,
+		skipVoteCreditsCheck: config.SkipVoteCreditsCheck,
+		autoConfirm:          config.AutoConfirm,
+		rollback:             config.Rollback,
 	}
 
 	if s.port == 0 {
@@ -403,15 +406,19 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	}
 
 	// take initial sample of vote credits and rank for the active key - use it to compare later
-	s.logger.Debug("pulling pre-failover vote credits sample...")
-	err = s.failoverStream.PullActiveIdentityVoteCreditsSample(s.solanaRPCClient)
-	if err != nil {
-		s.logger.Error("failed to pull active identity vote credits sample", "err", err)
-		s.failoverStream.SetErrorMessagef("server failed to pull active identity vote credits sample: %v", err)
-		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error("failed to send error message to client", "err", encodeErr)
+	if s.skipVoteCreditsCheck {
+		s.logger.Warn("--skip-vote-credits-check set, skipping pre-failover vote credits sample")
+	} else {
+		s.logger.Debug("pulling pre-failover vote credits sample...")
+		err = s.failoverStream.PullActiveIdentityVoteCreditsSample(s.solanaRPCClient)
+		if err != nil {
+			s.logger.Error("failed to pull active identity vote credits sample", "err", err)
+			s.failoverStream.SetErrorMessagef("server failed to pull active identity vote credits sample: %v", err)
+			if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
+				s.logger.Error("failed to send error message to client", "err", encodeErr)
+			}
+			return
 		}
-		return
 	}
 
 	// this is where the actual failover starts
