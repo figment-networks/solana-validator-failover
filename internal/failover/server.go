@@ -10,9 +10,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh/spinner"
+	"github.com/charmbracelet/log"
 	"github.com/quic-go/quic-go"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/constants"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
@@ -65,7 +64,7 @@ type Server struct {
 	streamTimeout        time.Duration
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	logger               zerolog.Logger
+	logger               *log.Logger
 	passiveNodeInfo      *NodeInfo
 	solanaRPCClient      solana.ClientInterface
 	rpcURL               string
@@ -106,7 +105,7 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		port:                 config.Port,
 		tlsConfig:            serverTLSConfig,
 		mtlsEnabled:          mtlsEnabled,
-		logger:               log.With().Logger(),
+		logger:               log.Default(),
 		ctx:                  ctx,
 		cancel:               cancel,
 		passiveNodeInfo:      config.PassiveNodeInfo,
@@ -169,7 +168,9 @@ func (s *Server) Start() error {
 	}
 	s.listener = listener
 
-	s.logger.Info().Msgf("Listening on port %d - run this program on the ACTIVE validator to continue", s.port)
+	s.logger.Info(style.RenderPinkString(fmt.Sprintf("listening on port %d - run this program on the ", s.port)) +
+		style.RenderActiveString("active", false) +
+		style.RenderPinkString(" validator to continue"))
 
 	for {
 		select {
@@ -181,7 +182,7 @@ func (s *Server) Start() error {
 				if err.Error() == "quic: server closed" {
 					return nil
 				}
-				s.logger.Error().Err(err).Msg("Failed to accept connection")
+				s.logger.Error("failed to accept connection", "err", err)
 				continue
 			}
 
@@ -194,18 +195,18 @@ func (s *Server) Start() error {
 func (s *Server) handleConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "connection closed")
 
-	s.logger.Debug().Str("remote_addr", conn.RemoteAddr().String()).Msg("Accepted new connection")
+	s.logger.Debug("accepted new connection", "remote_addr", conn.RemoteAddr().String())
 
 	if s.mtlsEnabled {
 		tlsState := conn.ConnectionState().TLS
 		if len(tlsState.PeerCertificates) > 0 {
 			peer := tlsState.PeerCertificates[0]
-			s.logger.Info().
-				Str("remote_addr", conn.RemoteAddr().String()).
-				Str("subject", peer.Subject.String()).
-				Str("issuer", peer.Issuer.String()).
-				Time("expires", peer.NotAfter).
-				Msg("mTLS: client certificate verified")
+			s.logger.Info("mTLS: client certificate verified",
+				"remote_addr", conn.RemoteAddr().String(),
+				"subject", peer.Subject.String(),
+				"issuer", peer.Issuer.String(),
+				"expires", peer.NotAfter,
+			)
 		}
 	}
 
@@ -215,11 +216,11 @@ func (s *Server) handleConnection(conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(s.ctx)
 		if err != nil {
-			s.logger.Debug().Str("remote_addr", conn.RemoteAddr().String()).Err(err).Msg("Failed to accept stream")
+			s.logger.Debug("failed to accept stream", "remote_addr", conn.RemoteAddr().String(), "err", err)
 			return
 		}
 
-		s.logger.Debug().Str("remote_addr", conn.RemoteAddr().String()).Msg("Accepted new stream")
+		s.logger.Debug("accepted new stream", "remote_addr", conn.RemoteAddr().String())
 		go s.handleStream(stream)
 	}
 }
@@ -232,10 +233,10 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	msgType := make([]byte, 1)
 	if _, err := io.ReadFull(stream, msgType); err != nil {
 		if err == io.EOF {
-			s.logger.Debug().Msg("Stream closed by peer")
+			s.logger.Debug("stream closed by peer")
 			return
 		}
-		s.logger.Debug().Msgf("Failed to read message type: %v", err)
+		s.logger.Debugf("failed to read message type: %v", err)
 		return
 	}
 
@@ -243,16 +244,16 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	// This gives a clear error when nodes are running incompatible versions,
 	// rather than the cryptic gob type-mismatch that would otherwise surface.
 	if err := readAndCheckWireVersion(stream); err != nil {
-		s.logger.Fatal().Err(err).Msg("aborting: " + err.Error())
+		s.logger.Fatal("aborting", "err", err)
 		return
 	}
 
 	switch msgType[0] {
 	case MessageTypeFailoverInitiateRequest: // failover
-		s.logger.Debug().Msgf("Received failover initiate request")
+		s.logger.Debug("received failover initiate request")
 		s.handleFailoverStream(stream)
 	default:
-		s.logger.Error().Msgf("Unknown message type: %d - ignoring stream", msgType[0])
+		s.logger.Errorf("unknown message type: %d - ignoring stream", msgType[0])
 	}
 }
 
@@ -266,7 +267,7 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	// Write our wire protocol version in the server→client direction before
 	// any gob encode so the client can verify compatibility symmetrically.
 	if err := writeWireVersion(stream); err != nil {
-		s.logger.Error().Err(err).Msg("failed to write wire version to client")
+		s.logger.Error("failed to write wire version to client", "err", err)
 		return
 	}
 
@@ -283,23 +284,59 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	clientVersion := s.failoverStream.GetActiveNodeInfo().SolanaValidatorFailoverVersion
 	serverVersion := pkgconstants.AppVersion
 
-	s.logger.Debug().
-		Str("server_version", serverVersion).
-		Str("client_version", clientVersion).
-		Msg("checking for client and server version mismatch")
+	s.logger.Debug("checking for client and server version mismatch",
+		"server_version", serverVersion,
+		"client_version", clientVersion,
+	)
 
 	if clientVersion != serverVersion {
 		s.failoverStream.LogErrorWithSetMessagef("Server (%s) and client (%s) version mismatch", serverVersion, clientVersion)
 		if err := s.failoverStream.Encode(); err != nil {
-			s.logger.Error().Err(err).Msg("failed to send error message to client")
+			s.logger.Error("failed to send error message to client", "err", err)
 		}
-		s.logger.Fatal().Msg("Server and client running different versions of this program - aborting")
+		s.logger.Fatal("server and client running different versions of this program - aborting")
 		return
 	}
+	activeMode := s.failoverStream.GetActiveNodeInfo().Consensus
+	passiveMode := s.passiveNodeInfo.Consensus
+	if activeMode != ConsensusTower && activeMode != ConsensusAlpenglow {
+		s.failoverStream.SetErrorMessagef("active node reported unsupported consensus mode %q", activeMode)
+		_ = s.failoverStream.Encode()
+		return
+	}
+	passiveState, err := DetectConsensus(s.rpcURL)
+	if err != nil {
+		s.failoverStream.SetErrorMessagef("cannot detect passive node consensus: %v", err)
+		_ = s.failoverStream.Encode()
+		return
+	}
+	if passiveState.Mode == "migrating" {
+		s.failoverStream.SetErrorMessage("passive node is migrating to Alpenglow; failover is disabled during migration")
+		_ = s.failoverStream.Encode()
+		return
+	}
+	if passiveState.Mode != passiveMode {
+		s.failoverStream.SetErrorMessagef("passive consensus declaration %q disagrees with local RPC consensus %q", passiveMode, passiveState.Mode)
+		_ = s.failoverStream.Encode()
+		return
+	}
+	if activeMode != passiveState.Mode || (activeMode == ConsensusAlpenglow && s.failoverStream.GetActiveNodeInfo().ConsensusGenesisSlot != passiveState.GenesisSlot) {
+		s.failoverStream.SetErrorMessagef("consensus mismatch: active=%s genesis=%d passive=%s genesis=%d", activeMode, s.failoverStream.GetActiveNodeInfo().ConsensusGenesisSlot, passiveState.Mode, passiveState.GenesisSlot)
+		_ = s.failoverStream.Encode()
+		return
+	}
+	s.passiveNodeInfo.Consensus = passiveState.Mode
+	s.passiveNodeInfo.ConsensusGenesisSlot = passiveState.GenesisSlot
+	s.failoverStream.SetPassiveNodeInfo(s.passiveNodeInfo)
 
-	// query gossip for client by its public IP
-	s.logger.Debug().Msgf("querying gossip for active node IP %s", s.failoverStream.GetActiveNodeInfo().PublicIP)
-	gossipActiveNode, err := s.solanaRPCClient.NodeFromIP(s.failoverStream.GetActiveNodeInfo().PublicIP)
+	// Query gossip for the client by both its public IP and configured active identity.
+	activeNodeInfo := s.failoverStream.GetActiveNodeInfo()
+	expectedActivePubkey := activeNodeInfo.Identities.Active.PubKey()
+	s.logger.Debug("querying gossip for active node",
+		"public_ip", activeNodeInfo.PublicIP,
+		"pubkey", expectedActivePubkey,
+	)
+	gossipActiveNode, err := s.solanaRPCClient.NodeFromIPWithExpectedPubkey(activeNodeInfo.PublicIP, expectedActivePubkey)
 	if err != nil {
 		s.failoverStream.LogErrorWithSetMessagef("Failed to validate active node: %v", err)
 		if s.failoverStream.Encode() != nil {
@@ -308,13 +345,9 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 		return
 	}
 
-	// ensure the failover request comes from the active node
-	if gossipActiveNode.IP() != s.failoverStream.GetActiveNodeInfo().PublicIP {
-		s.failoverStream.LogErrorWithSetMessagef(
-			"Failed to validate active node: active node IP %s does not match expected IP %s",
-			gossipActiveNode.IP(),
-			s.failoverStream.GetActiveNodeInfo().PublicIP,
-		)
+	// Ensure the failover request comes from the configured active node.
+	if err := validateActiveGossipIdentity(gossipActiveNode.IP(), gossipActiveNode.PubKey(), activeNodeInfo.PublicIP, expectedActivePubkey); err != nil {
+		s.failoverStream.LogErrorWithSetMessagef("Failed to validate active node: %v", err)
 		if s.failoverStream.Encode() != nil {
 			return
 		}
@@ -340,32 +373,32 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 		msg += " — both nodes must have rollback identically configured; fix the config and retry"
 		s.failoverStream.SetErrorMessage(msg)
 		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error().Err(encodeErr).Msg("failed to send error message to client")
+			s.logger.Error("failed to send error message to client", "err", encodeErr)
 		}
-		s.logger.Fatal().Msg(msg)
+		s.logger.Fatal(msg)
 		return
 	}
 
-	s.logger.Info().Msgf("%s connected from %s - failover plan:", s.failoverStream.GetActiveNodeInfo().Hostname, s.activeConn.RemoteAddr())
+	s.logger.Infof("%s connected from %s - failover plan:", s.failoverStream.GetActiveNodeInfo().Hostname, s.activeConn.RemoteAddr())
 
 	if err := s.failoverStream.ConfirmFailover(s.hooks, s.rollback, activeRPCURL, passiveRPCURL, s.autoConfirm); err != nil {
-		s.logger.Error().Err(err).Msg("failover cancelled")
+		s.logger.Error("failover cancelled", "err", err)
 
 		// Send error message to client before exiting
 		s.failoverStream.SetErrorMessagef("server cancelled failover: %v", err)
 		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error().Err(encodeErr).Msg("Failed to send error message to client")
+			s.logger.Error("failed to send error message to client", "err", encodeErr)
 		}
 
 		// close the server listener and cancel the context to stop accepting new connections
 		if s.listener != nil {
 			if err := s.listener.Close(); err != nil {
-				s.logger.Error().Err(err).Msg("failed to close listener")
+				s.logger.Error("failed to close listener", "err", err)
 			}
 		}
 		if s.transport != nil {
 			if err := s.transport.Close(); err != nil {
-				s.logger.Error().Err(err).Msg("failed to close transport")
+				s.logger.Error("failed to close transport", "err", err)
 			}
 		}
 		s.cancel()
@@ -374,15 +407,15 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 
 	// take initial sample of vote credits and rank for the active key - use it to compare later
 	if s.skipVoteCreditsCheck {
-		s.logger.Warn().Msg("--skip-vote-credits-check flag is set, skipping pre-failover vote credits check")
+		s.logger.Warn("--skip-vote-credits-check set, skipping pre-failover vote credits sample")
 	} else {
-		s.logger.Debug().Msg("Pulling pre-failover vote credits sample...")
+		s.logger.Debug("pulling pre-failover vote credits sample...")
 		err = s.failoverStream.PullActiveIdentityVoteCreditsSample(s.solanaRPCClient)
 		if err != nil {
-			s.logger.Error().Err(err).Msg("failed to pull active identity vote credits sample")
+			s.logger.Error("failed to pull active identity vote credits sample", "err", err)
 			s.failoverStream.SetErrorMessagef("server failed to pull active identity vote credits sample: %v", err)
 			if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-				s.logger.Error().Err(encodeErr).Msg("Failed to send error message to client")
+				s.logger.Error("failed to send error message to client", "err", encodeErr)
 			}
 			return
 		}
@@ -391,36 +424,49 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	// this is where the actual failover starts
 
 	var towerFile *os.File
-	// if skip tower sync is enabled, remove tower file if it exists
-	if s.skipTowerSync {
-		if utils.FileExists(s.failoverStream.GetPassiveNodeInfo().TowerFile) {
-			s.logger.Info().Msgf("removing existing tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-			if err := utils.RemoveFile(s.failoverStream.GetPassiveNodeInfo().TowerFile); err != nil {
-				s.failoverStream.SetErrorMessagef("failed to remove tower file at %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
-				if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-					s.logger.Error().Err(encodeErr).Msg("Failed to send error message to client")
-				}
-				s.logger.Fatal().Err(err).Msgf("failed to remove tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-				return
-			}
-		}
-	} else {
-		// Open tower file handle early to speed up failover
-		var err error
-		towerFile, err = os.OpenFile(
-			s.failoverStream.GetPassiveNodeInfo().TowerFile,
-			os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-			os.FileMode(0644), // User and group can read/write, others can read
-		)
-		if err != nil {
-			s.logger.Error().Err(err).Msgf("failed to open tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-			s.failoverStream.SetErrorMessagef("server failed to open its tower file %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
-			if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-				s.logger.Error().Err(encodeErr).Msg("Failed to send error message to client")
-			}
+	if passiveMode == "alpenglow" {
+		if s.skipTowerSync {
+			s.failoverStream.SetErrorMessage("--skip-tower-sync is unavailable with alpenglow consensus")
+			_ = s.failoverStream.Encode()
 			return
 		}
-		defer utils.SafeCloseFile(towerFile)
+		if err := preflightStateDestination(s.passiveNodeInfo.TowerFile, activeNodeInfo.TowerFileSizeBytes); err != nil {
+			s.failoverStream.SetErrorMessagef("cannot receive vote history: %v", err)
+			_ = s.failoverStream.Encode()
+			return
+		}
+	} else {
+		// if skip tower sync is enabled, remove tower file if it exists
+		if s.skipTowerSync {
+			if utils.FileExists(s.failoverStream.GetPassiveNodeInfo().TowerFile) {
+				s.logger.Infof("removing existing tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
+				if err := utils.RemoveFile(s.failoverStream.GetPassiveNodeInfo().TowerFile); err != nil {
+					s.failoverStream.SetErrorMessagef("failed to remove tower file at %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
+					if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
+						s.logger.Error("failed to send error message to client", "err", encodeErr)
+					}
+					s.logger.Fatal(fmt.Sprintf("failed to remove tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
+					return
+				}
+			}
+		} else {
+			// Open tower file handle early to speed up failover
+			var err error
+			towerFile, err = os.OpenFile(
+				s.failoverStream.GetPassiveNodeInfo().TowerFile,
+				os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+				os.FileMode(0644), // User and group can read/write, others can read
+			)
+			if err != nil {
+				s.logger.Error(fmt.Sprintf("failed to open tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
+				s.failoverStream.SetErrorMessagef("server failed to open its tower file %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
+				if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
+					s.logger.Error("failed to send error message to client", "err", encodeErr)
+				}
+				return
+			}
+			defer utils.SafeCloseFile(towerFile)
+		}
 	}
 
 	// run pre hooks when passive
@@ -431,102 +477,116 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	if err != nil {
 		s.failoverStream.SetErrorMessagef("server failed to run its pre-failover hooks: %v", err)
 		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error().Err(encodeErr).Msg("Failed to send error message to client")
+			s.logger.Error("failed to send error message to client", "err", encodeErr)
 		}
-		s.logger.Fatal().Err(err).Msg("failed to run pre hooks when passive")
+		s.logger.Fatal("failed to run pre hooks when passive", "err", err)
 		return
 	}
 
-	// set can proceed to true
+	// The local and peer consensus states were verified during the handshake.
+	// Continue with that result without querying RPC again before identity changes.
 	s.failoverStream.SetCanProceed(true)
 	if s.failoverStream.Encode() != nil {
 		return
 	}
 
-	// Alpenglow refuses set-identity unless this node holds the active identity's vote history,
-	// so it is synced alongside the tower file. Absent on pre-Alpenglow clusters.
-	syncVoteHistory := s.failoverStream.GetActiveNodeInfo().VoteHistoryFileSizeBytes > 0
-
-	if s.skipTowerSync && !syncVoteHistory {
-		s.logger.Info().Msg("Failover started - skipping tower file sync")
-	} else {
-		s.logger.Info().Msgf("Failover started - waiting for files from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
-
-		// Wait for the updated node info with the file bytes
+	if passiveMode == "alpenglow" {
+		s.logger.Infof("failover started - waiting for vote history from %s", activeNodeInfo.Hostname)
+		s.failoverStream.SetActiveNodeSyncTowerFileStartTime()
+		if err := s.failoverStream.receiveStateFile(s.passiveNodeInfo.TowerFile); err != nil {
+			s.logger.Error("vote-history transfer failed; active node may now be passive", "err", err)
+			s.failoverStream.SetErrorMessagef("vote-history transfer failed before activation: %v", err)
+			s.failoverStream.SetRollbackRequired(true)
+			_ = s.failoverStream.Encode()
+			return
+		}
+		// Receive the sender's updated timestamps and starting slot before
+		// recording the end slot or building the summary.
 		if err := s.failoverStream.Decode(); err != nil {
-			s.logger.Error().Err(err).Msg("failed to decode updated node info")
+			s.logger.Error("failed to receive Alpenglow failover timing metadata", "err", err)
+			s.failoverStream.SetErrorMessagef("failed to receive failover timing metadata: %v", err)
+			s.failoverStream.SetRollbackRequired(true)
+			_ = s.failoverStream.Encode()
+			return
+		}
+		if info, err := os.Stat(s.passiveNodeInfo.TowerFile); err == nil {
+			s.failoverStream.GetActiveNodeInfo().TowerFileSizeBytes = info.Size()
+			s.logger.Infof("received vote history file path=%s size=%d", s.passiveNodeInfo.TowerFile, info.Size())
+		} else {
+			s.logger.Warn("vote history was installed but its size could not be read for the summary", "path", s.passiveNodeInfo.TowerFile, "err", err)
+		}
+		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
+	} else if s.skipTowerSync {
+		s.logger.Info("failover started - skipping tower file sync")
+	} else {
+		s.logger.Infof("failover started - waiting for tower file from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
+
+		// Wait for the updated node info with tower file bytes
+		if err := s.failoverStream.Decode(); err != nil {
+			s.logger.Error("failed to decode updated node info", "err", err)
 			return
 		}
 
-		if err := s.writeVoteHistoryFile(syncVoteHistory); err != nil {
+		// check that the TowerFileBytes sent are the same as the hash of the tower file
+		computedTowerFileHash := s.failoverStream.GetActiveNodeInfo().ComputeTowerFileHashFromBytes(s.failoverStream.GetActiveNodeInfo().TowerFileBytes)
+		expectedTowerFileHash := s.failoverStream.GetActiveNodeInfo().TowerFileHash
+
+		s.logger.Debugf("checking tower file hash - received: %s expected: %s", computedTowerFileHash, expectedTowerFileHash)
+
+		if computedTowerFileHash != expectedTowerFileHash {
+			s.logger.Errorf("tower file hash mismatch: (got: %s) != (expected: %s)", computedTowerFileHash, expectedTowerFileHash)
+			s.logger.Error("aborting failover - save it by running:")
+			fmt.Printf(
+				"  rsync -avz --no-perms --no-i-r --no-progress --no-motd --no-times -e ssh -i <YOUR-SSH-KEY> -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no %s@%s:%s %s \n",
+				os.Getenv("USER"),
+				s.failoverStream.GetActiveNodeInfo().Hostname,
+				s.failoverStream.GetActiveNodeInfo().TowerFile,
+				s.failoverStream.GetPassiveNodeInfo().TowerFile,
+			)
+			s.logger.Error("then run:")
+			fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
+			s.logger.Fatal("tower file hash mismatch - failover aborted")
 			return
 		}
 
-		if !s.skipTowerSync {
-			// check that the TowerFileBytes sent are the same as the hash of the tower file
-			computedTowerFileHash := s.failoverStream.GetActiveNodeInfo().ComputeTowerFileHashFromBytes(s.failoverStream.GetActiveNodeInfo().TowerFileBytes)
-			expectedTowerFileHash := s.failoverStream.GetActiveNodeInfo().TowerFileHash
-
-			s.logger.Debug().Msgf("Checking tower file hash - received: %s expected: %s", computedTowerFileHash, expectedTowerFileHash)
-
-			if computedTowerFileHash != expectedTowerFileHash {
-				s.logger.Error().Msgf("tower file hash mismatch: (got: %s) != (expected: %s)", computedTowerFileHash, expectedTowerFileHash)
-				s.logger.Error().Msg("aborting failover - save it by running:")
-				fmt.Printf(
-					"  rsync -avz --no-perms --no-i-r --no-progress --no-motd --no-times -e ssh -i <YOUR-SSH-KEY> -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no %s@%s:%s %s \n",
-					os.Getenv("USER"),
-					s.failoverStream.GetActiveNodeInfo().Hostname,
-					s.failoverStream.GetActiveNodeInfo().TowerFile,
-					s.failoverStream.GetPassiveNodeInfo().TowerFile,
-				)
-				s.logger.Error().Msg("then run:")
-				fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
-				s.logger.Fatal().Msg("tower file hash mismatch - failover aborted")
-				return
-			}
-
-			// Write bytes and close immediately
-			if _, err := towerFile.Write(s.failoverStream.GetActiveNodeInfo().TowerFileBytes); err != nil {
-				s.logger.Error().Err(err).Msgf("failed to write tower file to %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-				return
-			}
-
-			// close the file handle - defer utils.SafeCloseFile() above won't conflict
-			if err := towerFile.Close(); err != nil {
-				s.logger.Error().Err(err).Msgf("failed to close tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-				return
-			}
-
-			s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
-			s.logger.Info().Msg("Received tower file")
+		// Write bytes and close immediately
+		if _, err := towerFile.Write(s.failoverStream.GetActiveNodeInfo().TowerFileBytes); err != nil {
+			s.logger.Error(fmt.Sprintf("failed to write tower file to %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
+			return
 		}
+
+		// close the file handle - defer utils.SafeCloseFile() above won't conflict
+		if err := towerFile.Close(); err != nil {
+			s.logger.Error(fmt.Sprintf("failed to close tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
+			return
+		}
+
+		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
+		s.logger.Info("received tower file")
 	}
 
 	// set identity to active
-	dryRunPrefix := " "
+	dryRunPrefix := ""
 	if s.isDryRunFailover {
-		dryRunPrefix = " (dry run) "
+		dryRunPrefix = style.RenderLightGreyString("(dry run)") + " "
 	}
-	s.logger.Info().
-		Str("command", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand).
-		Msgf("%sSetting identity to %s - %s",
-			dryRunPrefix,
-			style.RenderActiveString(strings.ToUpper(constants.NodeRoleActive), false),
-			style.RenderActiveString(s.failoverStream.GetPassiveNodeInfo().Identities.Active.PubKey(), false),
-		)
+	s.logger.Info(dryRunPrefix +
+		style.RenderPinkString("changing to ") +
+		style.RenderActiveString(constants.NodeRoleActive, false) +
+		style.RenderPinkString(" identity"))
 
 	s.failoverStream.SetPassiveNodeSetIdentityStartTime()
 
 	err = utils.RunCommand(utils.RunCommandParams{
 		CommandSlice: strings.Split(s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand, " "),
 		DryRun:       s.isDryRunFailover,
-		LogDebug:     s.logger.Debug().Enabled(),
+		LogDebug:     s.logger.GetLevel() <= log.DebugLevel,
 	})
 	if err != nil {
-		s.logger.Error().Err(err).Msgf("failed to set identity to active with command: %s", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
+		s.logger.Error(fmt.Sprintf("failed to set identity to active with command: %s", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand), "err", err)
 		if s.rollback.Enabled {
 			// Both sides have rollback enabled (mismatch is caught earlier).
-			s.logger.Warn().Msg("rollback enabled: signalling active node to revert, then re-asserting passive identity")
+			s.logger.Warn("rollback enabled: signalling active node to revert, then re-asserting passive identity")
 			s.failoverStream.SetRollbackRequired(true)
 			// best-effort — client may already be gone; ignore encode error
 			_ = s.failoverStream.Encode()
@@ -534,15 +594,15 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 				isDryRunFailover: s.isDryRunFailover,
 				isPostFailover:   true,
 			}), s.isDryRunFailover, s.logger); rbErr != nil {
-				s.logger.Error().Err(rbErr).Msg("rollback to passive FAILED — manual intervention required")
+				s.logger.Error("rollback to passive failed — manual intervention required", "err", rbErr)
 			}
 		} else {
-			s.logger.Error().Msg("rollback disabled — this node is still passive; the peer has also switched to passive")
+			s.logger.Error("rollback disabled — this node is still passive; the peer has also switched to passive")
 			if s.rollback.ToPassive.ResolvedCmd != "" {
-				s.logger.Error().Msgf("to recover this node: %s", s.rollback.ToPassive.ResolvedCmd)
+				s.logger.Errorf("to recover this node: %s", s.rollback.ToPassive.ResolvedCmd)
 			}
 		}
-		s.logger.Fatal().Err(err).Msgf("set identity to active failed — failover aborted")
+		s.logger.Fatal("set identity to active failed — failover aborted", "err", err)
 		return
 	}
 
@@ -551,7 +611,7 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	// get the current slot and record it - sometimes rpc will be a slot behind, if so, assume same-slot
 	failoverEndSlot, err := s.solanaRPCClient.GetCurrentSlot()
 	if err != nil {
-		s.logger.Warn().Err(err).Msg("failed to get current slot")
+		s.logger.Warn("failed to get current slot", "err", err)
 		err = nil
 	} else if failoverEndSlot < s.failoverStream.GetFailoverStartSlot() {
 		s.failoverStream.SetFailoverEndSlot(s.failoverStream.GetFailoverStartSlot())
@@ -579,17 +639,17 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 	summaryData := s.failoverStream.BuildSummaryData()
 	rendered, renderErr := RenderFailoverSummary(summaryData)
 	if renderErr != nil {
-		s.logger.Error().Err(renderErr).Msg("failed to render failover summary")
+		s.logger.Error("failed to render failover summary", "err", renderErr)
 	} else {
-		s.logger.Info().Msg("Post-failover state:")
-		fmt.Println(style.RenderMessageString(strings.Trim(rendered, "\n")))
+		s.logger.Info("post-failover state:")
+		fmt.Println(style.RenderMessageString(strings.TrimLeft(rendered, "\n")))
 	}
 
 	// monitor the credits by pulling configured samples
-	s.logger.Info().Msg("Monitoring vote credits post-failover...")
+	s.logger.Info("monitoring vote credits post-failover...")
 	err = s.failoverStream.PullActiveIdentityVoteCreditsSamples(s.solanaRPCClient, s.monitorConfig.CreditSamples.Count, s.monitorConfig.CreditSamples.IntervalDuration)
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to pull active identity vote credits samples")
+		s.logger.Error("failed to pull active identity vote credits samples", "err", err)
 	}
 
 	rankDifference, firstRank, lastRank, rankErr := s.failoverStream.GetVoteCreditRankDifference()
@@ -603,58 +663,43 @@ func (s *Server) handleFailoverStream(stream *quic.Stream) {
 		default:
 			rankMsg = style.RenderLightGreyString("unchanged")
 		}
-		s.logger.Info().Msgf("Vote credits: rank %s (%d → %d)", rankMsg, firstRank, lastRank)
+		s.logger.Infof("vote credits: rank %s (%d → %d)", rankMsg, firstRank, lastRank)
 	}
 
 	// close the stream and connection cleanly
 	if err := stream.Close(); err != nil {
-		s.logger.Error().Err(err).Msg("failed to close stream")
+		s.logger.Error("failed to close stream", "err", err)
 	}
 	if err := s.activeConn.CloseWithError(quic.ApplicationErrorCode(0), "failover complete"); err != nil {
-		s.logger.Debug().Msgf("closing connection after successful failover: %v", err)
+		s.logger.Debugf("closing connection after successful failover: %v", err)
 	}
 
 	// close the server listener and cancel the context to stop accepting new connections
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
-			s.logger.Error().Err(err).Msg("failed to close listener")
+			s.logger.Error("failed to close listener", "err", err)
 		}
 	}
 	if s.transport != nil {
 		if err := s.transport.Close(); err != nil {
-			s.logger.Error().Err(err).Msg("failed to close transport")
+			s.logger.Error("failed to close transport", "err", err)
 		}
 	}
 	s.cancel()
 }
 
-// writeVoteHistoryFile verifies and writes the active identity's vote history file. Alpenglow's
-// set-identity refuses to promote a node that does not have it, and it is keyed on the identity,
-// so it must land before the identity is set.
-func (s *Server) writeVoteHistoryFile(syncVoteHistory bool) error {
-	if !syncVoteHistory {
-		return nil
+func validateActiveGossipIdentity(actualIP, actualPubkey, expectedIP, expectedPubkey string) error {
+	if actualIP != expectedIP {
+		return fmt.Errorf("active node IP %s does not match expected IP %s", actualIP, expectedIP)
 	}
-
-	activeNodeInfo := s.failoverStream.GetActiveNodeInfo()
-	destination := s.failoverStream.GetPassiveNodeInfo().VoteHistoryFile
-
-	computedHash := activeNodeInfo.ComputeTowerFileHashFromBytes(activeNodeInfo.VoteHistoryFileBytes)
-	if computedHash != activeNodeInfo.VoteHistoryFileHash {
-		err := fmt.Errorf(
-			"vote history file hash mismatch: (got: %s) != (expected: %s)",
-			computedHash, activeNodeInfo.VoteHistoryFileHash,
+	if actualPubkey != expectedPubkey {
+		return fmt.Errorf(
+			"active node pubkey %s at IP %s does not match expected pubkey %s",
+			actualPubkey,
+			actualIP,
+			expectedPubkey,
 		)
-		s.logger.Error().Err(err).Msg("aborting failover before identity change")
-		return err
 	}
-
-	if err := os.WriteFile(destination, activeNodeInfo.VoteHistoryFileBytes, 0o600); err != nil {
-		s.logger.Error().Err(err).Msgf("failed to write vote history file to %s", destination)
-		return err
-	}
-
-	s.logger.Info().Msg("Received vote history file")
 	return nil
 }
 
@@ -668,7 +713,7 @@ func (s *Server) confirmGossipNodesPostFailover() {
 		isPassiveNodeKeySwitchReflectedInGossip bool
 	)
 
-	sp := spinner.New().Title("confirming gossip nodes switched roles...")
+	sp := spinner.New().Title(style.RenderPinkString("confirming gossip nodes switched roles..."))
 	sp.ActionWithErr(func(ctx context.Context) error {
 		maxRetries := 5
 		retryCount := 0
@@ -691,7 +736,7 @@ func (s *Server) confirmGossipNodesPostFailover() {
 			}
 			if err != nil && !hasRetriesLeft {
 				sp.Title(style.RenderErrorStringf("(attempt %d of %d) failed to refresh active node info from gossip - giving up", retryCount, maxRetries))
-				s.logger.Error().Err(err).Msgf("(attempt %d of %d) failed to refresh active node info from gossip - giving up", retryCount, maxRetries)
+				s.logger.Error(fmt.Sprintf("(attempt %d of %d) failed to refresh active node info from gossip - giving up", retryCount, maxRetries), "err", err)
 				return fmt.Errorf("(attempt %d of %d) failed to refresh active node info from gossip - giving up", retryCount, maxRetries)
 			}
 
@@ -780,13 +825,13 @@ func (s *Server) confirmGossipNodesPostFailover() {
 
 	err = sp.Run()
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to confirm gossip nodes switched roles - potentially serious shit - investigate immediately")
+		s.logger.Error("failed to confirm gossip nodes switched roles - potentially serious shit - investigate immediately", "err", err)
 	}
 
 	if isActiveNodeKeySwitchReflectedInGossip && isPassiveNodeKeySwitchReflectedInGossip {
-		s.logger.Info().Msg("Gossip confirms nodes switched roles successfully")
+		s.logger.Info("gossip confirms nodes switched roles successfully")
 	} else {
-		s.logger.Error().Msg("Gossip does not confirm role switch")
+		s.logger.Error("gossip does not confirm role switch")
 	}
 }
 
@@ -816,6 +861,7 @@ func (s *Server) getHookEnvMap(params hookEnvMapParams) (envMap map[string]strin
 	envMap["THIS_NODE_PASSIVE_IDENTITY_PUBKEY"] = s.passiveNodeInfo.Identities.Passive.PubKey()
 	envMap["THIS_NODE_PASSIVE_IDENTITY_KEYPAIR_FILE"] = s.passiveNodeInfo.Identities.Passive.KeyFile
 	envMap["THIS_NODE_CLIENT_VERSION"] = s.passiveNodeInfo.ClientVersion
+	envMap["THIS_NODE_CLIENT_VERSION_LOCAL_RPC"] = s.passiveNodeInfo.ClientVersionRPC
 	envMap["THIS_NODE_RPC_ADDRESS"] = s.rpcURL
 
 	// peer node is active
@@ -824,6 +870,7 @@ func (s *Server) getHookEnvMap(params hookEnvMapParams) (envMap map[string]strin
 	envMap["PEER_NODE_ACTIVE_IDENTITY_PUBKEY"] = s.failoverStream.GetActiveNodeInfo().Identities.Active.PubKey()
 	envMap["PEER_NODE_PASSIVE_IDENTITY_PUBKEY"] = s.failoverStream.GetActiveNodeInfo().Identities.Passive.PubKey()
 	envMap["PEER_NODE_CLIENT_VERSION"] = s.failoverStream.GetActiveNodeInfo().ClientVersion
+	envMap["PEER_NODE_CLIENT_VERSION_LOCAL_RPC"] = s.failoverStream.GetActiveNodeInfo().ClientVersionRPC
 
 	return
 }

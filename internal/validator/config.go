@@ -27,12 +27,11 @@ type TowerConfig struct {
 	Dir                  string `mapstructure:"dir"`
 	AutoEmptyWhenPassive bool   `mapstructure:"auto_empty_when_passive"`
 	FileNameTemplate     string `mapstructure:"file_name_template"`
-	// Alpenglow keeps per-identity vote history beside the tower file in the same dir.
-	VoteHistoryFileNameTemplate string `mapstructure:"vote_history_file_name_template"`
 }
 
 // FailoverConfig is the configuration for a failover
 type FailoverConfig struct {
+	Consensus                     ConsensusConfig      `mapstructure:"consensus"`
 	SetIdentityPassiveCmdTemplate string               `mapstructure:"set_identity_passive_cmd_template"`
 	SetIdentityActiveCmdTemplate  string               `mapstructure:"set_identity_active_cmd_template"`
 	Hooks                         hooks.FailoverHooks  `mapstructure:"hooks"`
@@ -43,6 +42,11 @@ type FailoverConfig struct {
 	Server                        ServerConfig         `mapstructure:"server"`
 	TLS                           TLSConfig            `mapstructure:"tls"`
 	IsDryRun                      bool
+}
+
+// ConsensusConfig selects the consensus state used during failover.
+type ConsensusConfig struct {
+	Mode string `mapstructure:"mode"`
 }
 
 // TLSConfig holds the optional mTLS configuration for the QUIC connection between validators.

@@ -1,8 +1,7 @@
 package solanavalidatorfailover
 
 import (
-	"github.com/rs/zerolog/log"
-	"github.com/sol-strategies/solana-validator-failover/internal/config"
+	"github.com/charmbracelet/log"
 	"github.com/sol-strategies/solana-validator-failover/internal/validator"
 	"github.com/spf13/cobra"
 )
@@ -22,14 +21,13 @@ var (
 		Short:        "run a failover - automatically detects what to do based on the node's role (active or passive)",
 		SilenceUsage: true,
 		Run: func(cmd *cobra.Command, args []string) {
-			cfg, err := config.NewFromFile(configPath)
-			if err != nil {
-				log.Fatal().Err(err).Msg("failed to load config")
+			if loadedConfig == nil {
+				log.Fatal("config was not loaded before running command")
 			}
 
-			v, err := validator.NewFromConfig(&cfg.Validator)
+			v, err := validator.NewFromConfig(&loadedConfig.Validator)
 			if err != nil {
-				log.Fatal().Err(err).Msg("failed to create validator")
+				log.Fatal("failed to create validator", "err", err)
 			}
 
 			err = v.Failover(validator.FailoverParams{
@@ -37,14 +35,13 @@ var (
 				NoWaitForHealthy:      noWaitForHealthy,
 				NoMinTimeToLeaderSlot: noMinTimeToLeaderSlot, // ignored when run on passive node
 				SkipTowerSync:         skipTowerSync,
-				SkipTowerFileCheck:    skipTowerFileCheck,
 				SkipVoteCreditsCheck:  skipVoteCreditsCheck,
 				AutoConfirm:           autoConfirm,
 				RollbackEnabled:       rollbackEnabled,
 				ToPeer:                toPeer,
 			})
 			if err != nil {
-				log.Fatal().Err(err).Msg("failed to failover")
+				log.Fatal("failed to failover", "err", err)
 			}
 		},
 	}
